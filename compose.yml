@@ -1,0 +1,16 @@
+services:
+  edge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/pudap/${MACHINE_ID}-edge:latest
+    container_name: ${MACHINE_ID}-edge
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/edge/.env:ro
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
