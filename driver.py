@@ -1,4 +1,4 @@
-"""PUDA GUI driver — controls any desktop instrument software via Hermes computer use."""
+"""PUDA GUI driver for Opentrons OT-2 — controls the Opentrons desktop App via Hermes computer use."""
 
 from __future__ import annotations
 
@@ -18,24 +18,17 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# cua-driver MCP client
+# cua-driver MCP client  (generic — unchanged from template)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CuaDriverClient:
     """
     Async MCP client for cua-driver.
 
-    cua-driver exposes computer-use actions as MCP tools. This client starts the
-    driver as a stdio subprocess, lists its tools at startup, then wraps the
-    most important ones (capture, click, type, key, scroll) behind a stable
-    async API regardless of how cua-driver names them in any given release.
-
-    Tool-name resolution order (first match wins):
-      capture : computer_use → screenshot → capture_screen → get_window_state
-      click   : computer_use → click → left_click
-      type    : computer_use → type → type_text
-      key     : computer_use → key → press_key → hotkey
-      scroll  : computer_use → scroll → scroll_element
+    Starts cua-driver as a stdio subprocess, discovers its MCP tools, then
+    exposes capture / click / type / key / scroll behind a stable async API.
+    Tool-name resolution tries the Hermes wrapper name first, then native
+    cua-driver names, so the client works across driver versions.
     """
 
     _CAPTURE_TOOLS = ["computer_use", "screenshot", "capture_screen", "get_window_state"]
@@ -50,7 +43,6 @@ class CuaDriverClient:
         self._tools: dict[str, Any] = {}
 
     async def start(self) -> None:
-        """Start cua-driver MCP subprocess and initialise the session."""
         params = StdioServerParameters(command="cua-driver", args=["mcp"])
         self._ctx = stdio_client(params)
         read, write = await self._ctx.__aenter__()
@@ -59,154 +51,87 @@ class CuaDriverClient:
         await self._session.initialize()
         tools_result = await self._session.list_tools()
         self._tools = {t.name: t for t in tools_result.tools}
-        logger.info("cua-driver connected. Available tools: %s", sorted(self._tools.keys()))
+        logger.info("cua-driver connected. Tools: %s", sorted(self._tools.keys()))
 
     async def stop(self) -> None:
-        """Gracefully close the MCP session and cua-driver subprocess."""
-        if self._session:
-            try:
-                await self._session.__aexit__(None, None, None)
-            except Exception:
-                pass
-        if self._ctx:
-            try:
-                await self._ctx.__aexit__(None, None, None)
-            except Exception:
-                pass
-
-    # ── tool resolution helpers ────────────────────────────────────────────
+        for obj in (self._session, self._ctx):
+            if obj:
+                try:
+                    await obj.__aexit__(None, None, None)
+                except Exception:
+                    pass
 
     def _resolve(self, candidates: list[str]) -> str:
-        """Return the first candidate tool name present in the driver."""
         for name in candidates:
             if name in self._tools:
                 return name
         raise RuntimeError(
-            f"None of the expected tools {candidates} found in cua-driver. "
-            f"Available: {sorted(self._tools.keys())}"
+            f"None of {candidates} found in cua-driver. Available: {sorted(self._tools.keys())}"
         )
 
     async def _call(self, tool: str, args: dict) -> Any:
         assert self._session, "CuaDriverClient not started"
         return await self._session.call_tool(tool, args)
 
-    # ── computer-use actions ───────────────────────────────────────────────
-
     async def capture(self, app: str | None = None, mode: str = "screenshot") -> Any:
-        """
-        Capture the screen or a specific app window.
-
-        Args:
-            app:  Application/window name to target. None = full screen.
-            mode: 'screenshot' for plain image, 'som' for Set-of-Marks numbered overlay,
-                  'ax' for accessibility-tree-only (no image, text-only models).
-        """
         tool = self._resolve(self._CAPTURE_TOOLS)
-        if tool == "computer_use":
-            args: dict = {"action": "capture", "mode": mode}
-            if app:
-                args["app"] = app
-        else:
-            # Native cua-driver tool — best-effort arg mapping
-            args = {}
-            if app:
-                args["app"] = app
-            if tool == "get_window_state":
-                # get_window_state returns the AX/UIA tree; no mode param
-                args.pop("mode", None)
+        args: dict = {"action": "capture", "mode": mode} if tool == "computer_use" else {}
+        if app:
+            args["app"] = app
         return await self._call(tool, args)
 
-    async def click(
-        self,
-        element: int | None = None,
-        x: int | None = None,
-        y: int | None = None,
-        button: str = "left",
-    ) -> Any:
-        """Click a SOM-numbered element or absolute coordinates."""
+    async def click(self, element: int | None = None, x: int | None = None,
+                    y: int | None = None, button: str = "left") -> Any:
         tool = self._resolve(self._CLICK_TOOLS)
-        if tool == "computer_use":
-            args: dict = {"action": "click", "button": button}
-            if element is not None:
-                args["element"] = element
-            elif x is not None and y is not None:
-                args["x"] = x
-                args["y"] = y
-        else:
-            args = {"button": button}
-            if element is not None:
-                args["element"] = element
-            elif x is not None and y is not None:
-                args["x"] = x
-                args["y"] = y
+        args: dict = {"action": "click", "button": button} if tool == "computer_use" else {"button": button}
+        if element is not None:
+            args["element"] = element
+        elif x is not None and y is not None:
+            args["x"] = x
+            args["y"] = y
         return await self._call(tool, args)
 
     async def type_text(self, text: str) -> Any:
-        """Type text into the currently focused element."""
         tool = self._resolve(self._TYPE_TOOLS)
-        if tool == "computer_use":
-            args = {"action": "type", "text": text}
-        else:
-            args = {"text": text}
+        args = {"action": "type", "text": text} if tool == "computer_use" else {"text": text}
         return await self._call(tool, args)
 
     async def key(self, keys: str, capture_after: bool = False) -> Any:
-        """Press a key or key combination (e.g. 'return', 'ctrl+s', 'escape')."""
         tool = self._resolve(self._KEY_TOOLS)
-        if tool == "computer_use":
-            args = {"action": "key", "keys": keys, "capture_after": capture_after}
-        else:
-            args = {"keys": keys}
+        args = ({"action": "key", "keys": keys, "capture_after": capture_after}
+                if tool == "computer_use" else {"keys": keys})
         return await self._call(tool, args)
 
     async def scroll(self, direction: str = "down", amount: int = 3) -> Any:
-        """Scroll in the focused element."""
         tool = self._resolve(self._SCROLL_TOOLS)
-        if tool == "computer_use":
-            args = {"action": "scroll", "direction": direction, "amount": amount}
-        else:
-            args = {"direction": direction, "amount": amount}
+        args = ({"action": "scroll", "direction": direction, "amount": amount}
+                if tool == "computer_use" else {"direction": direction, "amount": amount})
         return await self._call(tool, args)
-
-    # ── image extraction ───────────────────────────────────────────────────
 
     @staticmethod
     def extract_image_b64(result: Any) -> str | None:
-        """
-        Extract a base64-encoded PNG string from an MCP tool result.
-
-        cua-driver embeds images in tool-result content blocks with either a
-        'data' field (base64) or a 'url' field. We try both.
-        """
-        if result is None:
-            return None
         content = getattr(result, "content", None)
-        if content is None:
+        if not content:
             return None
         for block in content:
-            btype = getattr(block, "type", None)
-            # MCP image content block
-            if btype == "image":
+            if getattr(block, "type", None) == "image":
                 return getattr(block, "data", None)
-            # Some drivers use mimeType on a generic blob block
-            mime = getattr(block, "mimeType", None)
-            if mime and "image" in mime:
+            if "image" in getattr(block, "mimeType", ""):
                 return getattr(block, "data", None)
         return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PUDA GUI driver
+# Generic GUI driver base  (reusable across instruments)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GuiDriver:
     """
-    PUDA GUI driver — integrates any desktop instrument software via computer use.
+    Base PUDA GUI driver — controls any desktop software via Hermes computer use.
 
-    Replaces SDK calls with:
-      • Screenshot capture  (cua-driver → background, no focus steal)
-      • Vision LLM analysis (Anthropic Claude — reads instrument state from image)
-      • GUI event dispatch  (cua-driver → synthesised mouse / keyboard events)
+    Subclass this and add @command methods for instrument-specific workflows.
+    All vision analysis uses Claude via the ANTHROPIC_API_KEY in the environment
+    (managed by Hermes — no separate configuration needed).
     """
 
     _STATUS_PROMPT = (
@@ -215,389 +140,527 @@ class GuiDriver:
         "as a single JSON object. Include all numeric readings, units, modes, states, "
         "alarms, and error messages you can see. Use snake_case keys."
     )
-
-    # Vision model — uses Hermes's configured provider via ANTHROPIC_API_KEY in the environment.
     _LLM_MODEL = "claude-sonnet-4-5"
 
-    def __init__(
-        self,
-        target_app: str,
-        capture_interval: float = 30.0,
-    ) -> None:
+    def __init__(self, target_app: str, capture_interval: float = 30.0) -> None:
         self.target_app = target_app
         self.capture_interval = capture_interval
-
         self._last_status: dict = {}
-        # Reads ANTHROPIC_API_KEY from the environment automatically —
-        # no need to set it in .env; Hermes manages the credential.
-        self._anthropic = anthropic.Anthropic()
+        self._anthropic = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
         self._cua = CuaDriverClient()
 
-        # Background asyncio event loop — bridges sync PUDA worker threads
-        # to async MCP calls without blocking or spawning per-call loops.
         self._loop = asyncio.new_event_loop()
         self._loop_thread = threading.Thread(
-            target=self._loop.run_forever,
-            daemon=True,
-            name="guidriver-async-loop",
+            target=self._loop.run_forever, daemon=True, name="guidriver-async-loop"
         )
         self._loop_thread.start()
 
-    # ── lifecycle ──────────────────────────────────────────────────────────
-
     def startup(self) -> None:
-        """
-        Start the cua-driver MCP session.
-        Called once from main.py before the EdgeRunner loop.
-        """
         self._run(self._cua.start())
-        logger.info(
-            "GuiDriver ready — target_app=%r  model=%s", self.target_app, self.llm_model
-        )
+        logger.info("GuiDriver ready — target_app=%r", self.target_app)
 
     def _run(self, coro) -> Any:
-        """Submit an async coroutine to the background loop and block until done."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=60)
-
-    # ── vision helpers ─────────────────────────────────────────────────────
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=60)
 
     def _vision_query(self, img_b64: str, prompt: str) -> str:
-        """Send a base64 PNG screenshot to the vision LLM and return the text reply."""
         msg = self._anthropic.messages.create(
             model=self._LLM_MODEL,
             max_tokens=1024,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": img_b64,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64",
+                                                  "media_type": "image/png", "data": img_b64}},
+                    {"type": "text", "text": prompt},
+                ],
+            }],
         )
         return msg.content[0].text
 
-    def _parse_json_from_llm(self, text: str) -> dict:
-        """Extract the first JSON object from an LLM reply. Falls back to {'raw': text}."""
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
+    def _parse_json(self, text: str) -> dict:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
             try:
-                return json.loads(match.group())
+                return json.loads(m.group())
             except json.JSONDecodeError:
                 pass
         return {"raw": text}
 
     def _screenshot(self, mode: str = "screenshot") -> str:
-        """Capture and return a base64 PNG of the target app. Raises if capture fails."""
         result = self._run(self._cua.capture(app=self.target_app, mode=mode))
-        img_b64 = CuaDriverClient.extract_image_b64(result)
-        if img_b64 is None:
+        img = CuaDriverClient.extract_image_b64(result)
+        if img is None:
             raise RuntimeError(
                 f"cua-driver returned no image for app={self.target_app!r}. "
-                "Check that the app is visible and cua-driver has Screen Recording permission."
+                "Ensure the app is visible and Screen Recording is granted."
             )
-        return img_b64
+        return img
 
-    # ── PUDA machine_state ─────────────────────────────────────────────────
+    def _som_click(self, description: str) -> int:
+        """Capture SOM screenshot, ask LLM to identify element, click it. Returns element number."""
+        img = self._screenshot(mode="som")
+        prompt = (
+            f"This screenshot has SOM-numbered UI elements. "
+            f"Which number best matches: '{description}'? "
+            f"Reply with ONLY the integer, nothing else."
+        )
+        response = self._vision_query(img, prompt).strip()
+        m = re.search(r"\d+", response)
+        if not m:
+            raise RuntimeError(f"LLM could not identify element for {description!r}. Reply: {response!r}")
+        elem = int(m.group())
+        logger.info("_som_click: clicking element %d for %r", elem, description)
+        self._run(self._cua.click(element=elem))
+        return elem
+
+    # ── base PUDA commands ─────────────────────────────────────────────────
 
     @machine_state
     def snapshot(self) -> dict:
-        """
-        Cached state merged into every MACHINE_STATE update.
-        Values are set by the last successful status / telemetry call.
-        Do NOT read from the screen here — this runs on the event loop.
-        """
-        return {
-            "target_app": self.target_app,
-            "last_status": self._last_status,
-        }
-
-    # ── PUDA commands ──────────────────────────────────────────────────────
-
-    @command
-    def status(self) -> dict:
-        """
-        Capture a screenshot of the instrument software and extract its current
-        status using vision LLM analysis.
-
-        The LLM reads all visible readings, modes, alarms, and values from the
-        screenshot and returns them as a JSON object with snake_case keys.
-
-        Returns:
-            dict: All status fields visible on the instrument software screen.
-        """
-        logger.info("status: capturing %r for vision analysis", self.target_app)
-        img_b64 = self._screenshot(mode="screenshot")
-        response = self._vision_query(img_b64, self._STATUS_PROMPT)
-        self._last_status = self._parse_json_from_llm(response)
-        logger.info("status result: %s", self._last_status)
-        return self._last_status
+        return {"target_app": self.target_app, "last_status": self._last_status}
 
     @command
     def capture_screenshot(self) -> dict:
-        """
-        Capture a raw screenshot of the target application.
-
-        Returns:
-            dict: {'app': str, 'image_b64': str}  — base64-encoded PNG.
-        """
-        logger.info("capture_screenshot: %r", self.target_app)
-        img_b64 = self._screenshot(mode="screenshot")
-        return {"app": self.target_app, "image_b64": img_b64}
-
-    @command
-    def find_and_click(self, description: str) -> dict:
-        """
-        Locate a UI element by natural-language description using SOM vision, then
-        click it.
-
-        The driver captures a Set-of-Marks screenshot (each visible element is
-        numbered), sends it to the vision LLM with the description, receives the
-        element number, and dispatches a click — all without bringing the window
-        to the foreground.
-
-        Args:
-            description: Plain-English description of the element to click, e.g.
-                         "the Start button", "flow rate setpoint field",
-                         "the Run/Stop toggle in the toolbar".
-
-        Returns:
-            dict: {'clicked_element': int, 'description': str}
-        """
-        logger.info("find_and_click: looking for %r in %r", description, self.target_app)
-        img_b64 = self._screenshot(mode="som")
-        prompt = (
-            f"This screenshot uses SOM (Set of Marks) numbering — each interactive "
-            f"UI element has an integer label.\n"
-            f"Which element number best matches: '{description}'?\n"
-            f"Reply with ONLY the integer element number, nothing else."
-        )
-        response = self._vision_query(img_b64, prompt).strip()
-        m = re.search(r"\d+", response)
-        if not m:
-            raise RuntimeError(
-                f"LLM could not identify an element for {description!r}. "
-                f"LLM reply: {response!r}"
-            )
-        element_num = int(m.group())
-        logger.info("find_and_click: clicking element %d", element_num)
-        self._run(self._cua.click(element=element_num))
-        return {"clicked_element": element_num, "description": description}
-
-    @command
-    def type_text(self, text: str, field_description: str = "") -> dict:
-        """
-        Type text into a UI field.
-
-        If field_description is provided, the driver first calls find_and_click
-        to focus the correct field before typing.
-
-        Args:
-            text:              Text to type.
-            field_description: Optional — click this field before typing, e.g.
-                               "the flow rate input box". Leave empty to type into
-                               whatever is currently focused.
-
-        Returns:
-            dict: {'typed': str, 'field': str}
-        """
-        if field_description:
-            self.find_and_click(field_description)
-        logger.info("type_text: typing %r into %r", text, field_description or "<focused>")
-        self._run(self._cua.type_text(text))
-        return {"typed": text, "field": field_description}
-
-    @command
-    def press_key(self, keys: str) -> dict:
-        """
-        Press a keyboard shortcut or key in the target application.
-
-        Args:
-            keys: Key name or combination, e.g. 'return', 'escape', 'ctrl+s',
-                  'f5', 'ctrl+shift+r', 'alt+f4'.
-
-        Returns:
-            dict: {'keys': str}
-        """
-        logger.info("press_key: %s", keys)
-        self._run(self._cua.key(keys))
-        return {"keys": keys}
-
-    @command
-    def run_gui_step(self, instruction: str) -> dict:
-        """
-        Execute one natural-language GUI instruction autonomously.
-
-        The driver captures a SOM screenshot, asks the vision LLM to plan the
-        single next GUI action (click / type / key) needed to fulfil the
-        instruction, then executes it.
-
-        Use this for ad-hoc control of the instrument. For repeatable sequences,
-        build a PUDA protocol that chains multiple run_gui_step calls or
-        more specific commands.
-
-        Args:
-            instruction: Natural-language description of what to do, e.g.
-                         "Set the temperature setpoint to 37 °C",
-                         "Click the Stop button",
-                         "Open the File menu and choose Export Data".
-
-        Returns:
-            dict: {'instruction': str, 'action_taken': dict, 'result': dict}
-        """
-        logger.info("run_gui_step: %r", instruction)
-        img_b64 = self._screenshot(mode="som")
-        plan_prompt = (
-            f"You are a GUI automation agent controlling '{self.target_app}'.\n"
-            f"The screenshot shows the current UI with SOM-numbered interactive elements.\n\n"
-            f"Instruction: {instruction}\n\n"
-            f"Respond with ONLY a JSON object for the single best next action:\n"
-            f'  {{"action": "click", "element": <N>}}\n'
-            f'  {{"action": "type",  "text":    "<string>"}}\n'
-            f'  {{"action": "key",   "keys":    "<keys>"}}\n'
-            f"Choose exactly one action. Do not include any explanation."
-        )
-        plan_text = self._vision_query(img_b64, plan_prompt)
-        match = re.search(r"\{.*\}", plan_text, re.DOTALL)
-        if not match:
-            raise RuntimeError(
-                f"LLM did not return a valid action JSON. Reply: {plan_text!r}"
-            )
-        action = json.loads(match.group())
-        action_type = action.get("action", "")
-        result: dict = {}
-
-        if action_type == "click":
-            elem = action.get("element")
-            self._run(self._cua.click(element=elem))
-            result = {"clicked_element": elem}
-        elif action_type == "type":
-            text = action.get("text", "")
-            self._run(self._cua.type_text(text))
-            result = {"typed": text}
-        elif action_type == "key":
-            keys = action.get("keys", "")
-            self._run(self._cua.key(keys))
-            result = {"keys": keys}
-        else:
-            raise RuntimeError(
-                f"Unknown action type from LLM: {action_type!r}. Full action: {action}"
-            )
-
-        logger.info("run_gui_step done: %s → %s", instruction, action)
-        return {"instruction": instruction, "action_taken": action, "result": result}
+        """Return a raw base64 PNG screenshot of the target application."""
+        return {"app": self.target_app, "image_b64": self._screenshot()}
 
     @command
     def ask_screen(self, question: str) -> dict:
         """
-        Ask the vision LLM an arbitrary question about the current state of the
-        instrument software screen. Useful for read-only inspection without
-        triggering any actions.
+        Ask the vision LLM a read-only question about the current screen state.
 
         Args:
-            question: Free-form question about the screen, e.g.
-                      "What is the current pump flow rate?",
-                      "Is there any active alarm or warning?",
-                      "What measurement is currently selected?".
+            question: Free-form question, e.g. 'Is there an active error message?'
 
         Returns:
-            dict: {'question': str, 'answer': str, 'parsed': dict | None}
+            dict: {'question': str, 'answer': str}
         """
-        logger.info("ask_screen: %r", question)
-        img_b64 = self._screenshot(mode="screenshot")
-        answer = self._vision_query(img_b64, question)
-        parsed = self._parse_json_from_llm(answer) if answer.strip().startswith("{") else None
-        return {"question": question, "answer": answer, "parsed": parsed}
+        img = self._screenshot()
+        answer = self._vision_query(img, question)
+        return {"question": question, "answer": answer}
 
     @command
-    def home(self) -> bool:
+    def find_and_click(self, description: str) -> dict:
         """
-        Navigate the target application to its main / home screen.
+        Locate a UI element by description using SOM vision and click it.
 
-        Captures the current screen, asks the LLM whether the app is already
-        on the home screen; if not, clicks the element the LLM identifies as
-        the path back to home (e.g. Home button, back arrow, main tab).
+        Args:
+            description: Plain-English description of the element to click.
 
         Returns:
-            bool: True when the home sequence completes.
+            dict: {'clicked_element': int, 'description': str}
         """
-        logger.info("home: navigating %r to home screen", self.target_app)
-        img_b64 = self._screenshot(mode="som")
-        home_prompt = (
-            f"Is the application '{self.target_app}' currently showing its main/home screen? "
-            f"If yes, reply with exactly the word HOME. "
-            f"If not, reply with only the integer SOM element number to click to navigate home "
-            f"(e.g. a Home button, main tab, or back arrow)."
-        )
-        response = self._vision_query(img_b64, home_prompt).strip()
-        if "HOME" in response.upper():
-            logger.info("home: already at home screen")
-        else:
-            m = re.search(r"\d+", response)
-            if m:
-                elem = int(m.group())
-                logger.info("home: clicking element %d to navigate home", elem)
-                self._run(self._cua.click(element=elem))
-            else:
-                logger.warning("home: LLM gave unexpected response: %r", response)
-        return True
+        logger.info("find_and_click: %r", description)
+        elem = self._som_click(description)
+        return {"clicked_element": elem, "description": description}
+
+    @command
+    def press_key(self, keys: str) -> dict:
+        """
+        Press a keyboard shortcut in the target application.
+
+        Args:
+            keys: Key combination, e.g. 'escape', 'ctrl+s', 'f5'.
+
+        Returns:
+            dict: {'keys': str}
+        """
+        self._run(self._cua.key(keys))
+        return {"keys": keys}
 
     @command
     def reset(self) -> bool:
-        """
-        Software reset — press Escape to cancel any in-progress operation and
-        return the instrument software to an idle/ready state.
-
-        Returns:
-            bool: True if the reset key was dispatched successfully.
-        """
-        logger.info("reset: sending Escape to %r", self.target_app)
+        """Send Escape to cancel any in-progress operation."""
         self._run(self._cua.key("escape"))
         return True
 
     @command
     def shutdown(self) -> bool:
-        """
-        Shut down the GUI driver. Closes the cua-driver MCP session cleanly.
-
-        Returns:
-            bool: True if shutdown was successful.
-        """
-        logger.info("shutdown: closing cua-driver MCP session")
+        """Close the cua-driver MCP session cleanly."""
         try:
             self._run(self._cua.stop())
         except Exception as e:
-            logger.warning("shutdown: error closing cua-driver: %s", e)
+            logger.warning("shutdown error: %s", e)
         self._loop.call_soon_threadsafe(self._loop.stop)
         return True
 
-    # ── PUDA telemetry streams ─────────────────────────────────────────────
-
     @tlm_stream(interval=30.0, name="instrument_status")
     def stream_status(self) -> dict | None:
-        """
-        Periodic vision-based status poll.
-
-        Captures a screenshot of the instrument software every CAPTURE_INTERVAL
-        seconds and extracts the current status via the vision LLM. Published to:
-            puda.<machine_id>.tlm.stream.instrument_status
-
-        Returns None to skip a sample (keeps the stream alive but publishes nothing).
-        """
+        """Periodic vision-based status poll — published every capture_interval seconds."""
         try:
-            img_b64 = self._screenshot(mode="screenshot")
-            response = self._vision_query(img_b64, self._STATUS_PROMPT)
-            self._last_status = self._parse_json_from_llm(response)
+            img = self._screenshot()
+            response = self._vision_query(img, self._STATUS_PROMPT)
+            self._last_status = self._parse_json(response)
             return self._last_status
         except Exception as e:
-            logger.warning("stream_status: failed — %s", e)
+            logger.warning("stream_status failed: %s", e)
+            return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Opentrons OT-2 GUI driver
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OpentronGuiDriver(GuiDriver):
+    """
+    PUDA GUI driver for the Opentrons OT-2 liquid-handling robot.
+
+    Controls the **Opentrons desktop App** (not the robot directly) via
+    Hermes computer use — no HTTP API or SSH required. All commands interact
+    with the App's UI the same way a human operator would.
+
+    Opentrons App navigation recap
+    ───────────────────────────────
+    Left sidebar  → Protocols | Devices | Settings
+    Protocols tab → Import button (top-right) | protocol list (⋮ menu per row)
+    Setup screen  → Robot Calibration → Labware Position Check → Proceed to Run
+    Run tab       → Start run | Pause | Cancel run | live step log
+
+    PUDA commands
+    ─────────────
+    status              — screenshot → LLM reads run state, step, progress
+    get_protocol_list   — list all protocols visible in the Protocols tab
+    import_protocol     — Import a protocol file into the App
+    start_setup         — Open setup for a named protocol (⋮ → Start setup)
+    select_robot        — Choose the OT-2 robot on the setup screen
+    start_run           — Click "Start run" to begin the protocol
+    pause_run           — Pause an active run
+    resume_run          — Resume a paused run
+    cancel_run          — Cancel / stop the current run
+    get_run_progress    — Read current step and progress from the Run tab
+    navigate_protocols  — Go to the Protocols tab in the sidebar
+    navigate_devices    — Go to the Devices tab in the sidebar
+    home                — Navigate to the Protocols tab (home screen)
+    """
+
+    _STATUS_PROMPT = (
+        "You are reading a screenshot of the Opentrons App controlling an OT-2 robot. "
+        "Extract the current state and return ONLY a JSON object with these fields "
+        "(use null for fields not visible): "
+        "run_status (idle/running/paused/complete/error/stopped), "
+        "current_step (integer or null), "
+        "total_steps (integer or null), "
+        "current_step_description (string or null), "
+        "protocol_name (string or null), "
+        "robot_name (string or null), "
+        "elapsed_time (string or null), "
+        "errors (list of strings, empty list if none), "
+        "tab (protocols/setup/run/devices/settings or null)."
+    )
+
+    def __init__(
+        self,
+        target_app: str = "Opentrons",
+        robot_name: str = "",
+        capture_interval: float = 15.0,
+    ) -> None:
+        super().__init__(target_app=target_app, capture_interval=capture_interval)
+        self.robot_name = robot_name   # used by select_robot to pick the right OT-2
+
+    # ── machine state ──────────────────────────────────────────────────────
+
+    @machine_state
+    def snapshot(self) -> dict:
+        return {
+            "target_app": self.target_app,
+            "robot_name": self.robot_name,
+            "last_status": self._last_status,
+        }
+
+    # ── status ─────────────────────────────────────────────────────────────
+
+    @command
+    def status(self) -> dict:
+        """
+        Capture a screenshot of the Opentrons App and extract the current run state.
+
+        Returns:
+            dict: run_status, current_step, total_steps, current_step_description,
+                  protocol_name, robot_name, elapsed_time, errors, tab.
+        """
+        logger.info("status: reading Opentrons App screen")
+        img = self._screenshot()
+        response = self._vision_query(img, self._STATUS_PROMPT)
+        self._last_status = self._parse_json(response)
+        logger.info("status: %s", self._last_status)
+        return self._last_status
+
+    # ── navigation ─────────────────────────────────────────────────────────
+
+    @command
+    def navigate_protocols(self) -> bool:
+        """
+        Click 'Protocols' in the left sidebar to go to the Protocols tab.
+
+        Returns:
+            bool: True when the click was dispatched.
+        """
+        logger.info("navigate_protocols")
+        self._som_click("Protocols in the left sidebar")
+        return True
+
+    @command
+    def navigate_devices(self) -> bool:
+        """
+        Click 'Devices' in the left sidebar to go to the Devices / robot list tab.
+
+        Returns:
+            bool: True when the click was dispatched.
+        """
+        logger.info("navigate_devices")
+        self._som_click("Devices in the left sidebar")
+        return True
+
+    @command
+    def home(self) -> bool:
+        """
+        Navigate to the Protocols tab (the App's home screen).
+
+        Returns:
+            bool: True when navigation is complete.
+        """
+        return self.navigate_protocols()
+
+    # ── protocol management ────────────────────────────────────────────────
+
+    @command
+    def get_protocol_list(self) -> dict:
+        """
+        Read the list of protocols shown on the Protocols tab.
+
+        Navigates to the Protocols tab first if not already there, then uses
+        vision to extract protocol names and their statuses.
+
+        Returns:
+            dict: {'protocols': [{'name': str, 'status': str}, ...]}
+        """
+        logger.info("get_protocol_list")
+        self.navigate_protocols()
+        img = self._screenshot()
+        prompt = (
+            "List every protocol visible in this Opentrons App Protocols tab. "
+            "Return ONLY a JSON object: "
+            '{\"protocols\": [{\"name\": \"<name>\", \"status\": \"<status>\"}]}'
+        )
+        response = self._vision_query(img, prompt)
+        result = self._parse_json(response)
+        logger.info("get_protocol_list: %s", result)
+        return result
+
+    @command
+    def import_protocol(self, file_path: str) -> dict:
+        """
+        Import a protocol file into the Opentrons App.
+
+        Clicks the 'Import' button in the Protocols tab to open the import sidebar,
+        then uses the system file picker to select the given file path.
+
+        Args:
+            file_path: Absolute path to the protocol file (.py or .json),
+                       e.g. 'C:\\protocols\\serial_dilution.py'.
+
+        Returns:
+            dict: {'file_path': str, 'imported': bool, 'message': str}
+        """
+        logger.info("import_protocol: %s", file_path)
+        self.navigate_protocols()
+
+        # Click the Import button (top-right of Protocols tab)
+        self._som_click("Import button in the top right corner")
+
+        # The import sidebar opens — click "Choose File" to open the file picker
+        self._som_click("Choose File button in the import sidebar")
+
+        # Type the file path directly into the system file picker and confirm
+        import time
+        time.sleep(0.5)  # let the file picker open
+        self._run(self._cua.type_text(file_path))
+        self._run(self._cua.key("return"))
+
+        # Wait for analysis and verify success via screenshot
+        time.sleep(2.0)
+        img = self._screenshot()
+        prompt = (
+            f"Was the protocol file '{file_path}' successfully imported in this "
+            "Opentrons App screenshot? "
+            "Return ONLY JSON: {\"imported\": true/false, \"message\": \"<description>\"}"
+        )
+        result = self._parse_json(self._vision_query(img, prompt))
+        result["file_path"] = file_path
+        logger.info("import_protocol result: %s", result)
+        return result
+
+    # ── run lifecycle ──────────────────────────────────────────────────────
+
+    @command
+    def start_setup(self, protocol_name: str) -> dict:
+        """
+        Open the setup screen for a protocol by clicking its three-dot (⋮) menu
+        and selecting 'Start setup'.
+
+        Args:
+            protocol_name: Name of the protocol as shown in the Protocols tab list.
+
+        Returns:
+            dict: {'protocol_name': str, 'setup_opened': bool}
+        """
+        logger.info("start_setup: %r", protocol_name)
+        self.navigate_protocols()
+
+        # Click the ⋮ menu for this specific protocol
+        self._som_click(f"three-dot menu (⋮) for the protocol named '{protocol_name}'")
+
+        # Click 'Start setup' from the dropdown
+        self._som_click("Start setup option in the dropdown menu")
+
+        import time
+        time.sleep(1.0)
+        return {"protocol_name": protocol_name, "setup_opened": True}
+
+    @command
+    def select_robot(self, robot_name: str = "") -> dict:
+        """
+        Select the OT-2 robot on the setup screen.
+
+        If robot_name is empty, uses the driver's configured robot_name.
+        If only one robot is available, clicks it directly.
+
+        Args:
+            robot_name: Display name of the robot in the App. Defaults to
+                        the ROBOT_NAME set in .env.
+
+        Returns:
+            dict: {'robot_name': str, 'selected': bool}
+        """
+        name = robot_name or self.robot_name
+        logger.info("select_robot: %r", name)
+        if name:
+            self._som_click(f"robot named '{name}' in the robot selection list")
+        else:
+            # Select the first available robot
+            self._som_click("first available robot in the robot selection list")
+
+        import time
+        time.sleep(0.5)
+        self._som_click("Proceed to setup button")
+        return {"robot_name": name, "selected": True}
+
+    @command
+    def start_run(self) -> dict:
+        """
+        Click 'Start run' on the Run tab to begin executing the protocol.
+
+        Call this after start_setup() → select_robot() → (optional) Labware
+        Position Check. The Opentrons App must be on the setup or run screen.
+
+        Returns:
+            dict: {'started': bool, 'run_status': str}
+        """
+        logger.info("start_run")
+        self._som_click("Start run button")
+        import time
+        time.sleep(1.5)
+        return {"started": True, "run_status": "running"}
+
+    @command
+    def pause_run(self) -> dict:
+        """
+        Pause the currently running protocol.
+
+        Returns:
+            dict: {'paused': bool}
+        """
+        logger.info("pause_run")
+        self._som_click("Pause button")
+        import time
+        time.sleep(0.5)
+        return {"paused": True}
+
+    @command
+    def resume_run(self) -> dict:
+        """
+        Resume a paused protocol run.
+
+        Returns:
+            dict: {'resumed': bool}
+        """
+        logger.info("resume_run")
+        self._som_click("Resume button")
+        import time
+        time.sleep(0.5)
+        return {"resumed": True}
+
+    @command
+    def cancel_run(self) -> dict:
+        """
+        Cancel (stop) the current protocol run.
+
+        The App will ask for confirmation — this command also confirms the
+        cancellation by clicking the confirmation button.
+
+        Returns:
+            dict: {'cancelled': bool}
+        """
+        logger.info("cancel_run")
+        self._som_click("Cancel run button")
+        import time
+        time.sleep(0.5)
+        # Confirm the cancellation dialog if it appears
+        img = self._screenshot()
+        prompt = (
+            "Is there a cancellation confirmation dialog visible in this screenshot? "
+            "Reply with only YES or NO."
+        )
+        if "YES" in self._vision_query(img, prompt).upper():
+            self._som_click("confirm cancellation button in the dialog")
+        return {"cancelled": True}
+
+    # ── run monitoring ─────────────────────────────────────────────────────
+
+    @command
+    def get_run_progress(self) -> dict:
+        """
+        Read the current run progress from the Run tab.
+
+        Uses vision to extract the current step number, total steps, step
+        description, elapsed time, and any errors shown in the run log.
+
+        Returns:
+            dict: run_status, current_step, total_steps, current_step_description,
+                  elapsed_time, errors.
+        """
+        logger.info("get_run_progress")
+        img = self._screenshot()
+        prompt = (
+            "Read the Opentrons App Run tab and extract the run progress. "
+            "Return ONLY JSON: "
+            "{\"run_status\": \"running|paused|complete|error\", "
+            "\"current_step\": <int or null>, "
+            "\"total_steps\": <int or null>, "
+            "\"current_step_description\": \"<string or null>\", "
+            "\"elapsed_time\": \"<string or null>\", "
+            "\"errors\": [<strings>]}"
+        )
+        result = self._parse_json(self._vision_query(img, prompt))
+        logger.info("get_run_progress: %s", result)
+        return result
+
+    # ── telemetry stream ───────────────────────────────────────────────────
+
+    @tlm_stream(interval=15.0, name="run_status")
+    def stream_run_status(self) -> dict | None:
+        """
+        Publish Opentrons run status every 15 seconds.
+
+        Captures the App screen and extracts run_status, current step,
+        progress, and any errors. Published to:
+            puda.<machine_id>.tlm.stream.run_status
+        """
+        try:
+            img = self._screenshot()
+            response = self._vision_query(img, self._STATUS_PROMPT)
+            self._last_status = self._parse_json(response)
+            return self._last_status
+        except Exception as e:
+            logger.warning("stream_run_status failed: %s", e)
             return None

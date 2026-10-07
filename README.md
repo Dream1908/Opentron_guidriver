@@ -1,26 +1,12 @@
-# PUDA GUI Driver
+# PUDA GUI Driver — Opentrons OT-2
 
-A PUDA edge service that integrates **any desktop instrument software** into PUDA without a hardware SDK. Instead of a vendor SDK, it uses:
+A PUDA edge service that integrates the **Opentrons OT-2** liquid-handling robot into PUDA by controlling the **Opentrons desktop App** via Hermes computer use — no HTTP API, no SSH, no vendor SDK required.
 
 | Layer | Technology | Role |
 |---|---|---|
-| GUI automation | [Hermes computer use](https://hermes-agent.nousresearch.com/docs/user-guide/features/computer-use) → `cua-driver` MCP | Background click / type / key dispatch, no focus steal |
-| Vision reading | Claude vision via Hermes model config | Read instrument state from screenshots |
+| GUI automation | [Hermes computer use](https://hermes-agent.nousresearch.com/docs/user-guide/features/computer-use) → `cua-driver` MCP | Background click / type / key dispatch in the Opentrons App |
+| Vision reading | Claude vision via Hermes model config | Read run status, step progress, errors from screenshots |
 | PUDA integration | `puda` `EdgeRunner` + NATS | Expose commands and telemetry to the PUDA platform |
-
----
-
-## Repo Structure
-
-```
-PUDA_guidriver/
-├── pyproject.toml   # dependencies (puda, mcp, anthropic, pydantic-settings)
-├── main.py          # Config → GuiDriver → EdgeNatsClient → EdgeRunner
-├── driver.py        # CuaDriverClient (MCP) + GuiDriver (@command, @tlm_stream)
-├── .env.example     # environment variable template
-├── Dockerfile       # container build (optional)
-└── compose.yml      # docker compose (optional)
-```
 
 ---
 
@@ -30,44 +16,69 @@ PUDA_guidriver/
 PUDA CLI / Protocol
        │  NATS
        ▼
-  EdgeRunner  ──────────────────────────►  GuiDriver (@command methods)
+  EdgeRunner  ──────────────────────────►  OpentronGuiDriver (@command methods)
                                                   │
                            ┌───────────────────────┤
                            │                       │
                      cua-driver MCP          Claude vision
                     (GUI automation)     (via Hermes model config)
                            │                       │
-                     ┌─────▼──────┐      ┌─────────▼────────┐
-                     │ Instrument │ PNG  │  Extract status / │
-                     │ Software   │─────►│  plan GUI actions │
-                     │ (any app)  │      └──────────────────┘
-                     └────────────┘
+                     ┌─────▼──────────┐  ┌─────────▼────────────┐
+                     │ Opentrons App  │  │  Extract run status / │
+                     │ (desktop UI)   │──►  plan GUI actions     │
+                     └────────────────┘  └──────────────────────┘
 ```
 
-1. A PUDA command arrives via NATS (e.g. `status`, `find_and_click`, `run_gui_step`).
-2. `GuiDriver` calls `cua-driver` (via MCP) to **capture a screenshot** of the instrument window — in the background, no focus change.
-3. The screenshot is sent to **Claude vision** to extract the instrument state or decide which UI element to interact with. The LLM model and API credentials come from your existing Hermes configuration — no separate setup required.
-4. `GuiDriver` dispatches the synthesised mouse/keyboard event back through `cua-driver`.
+1. A PUDA command arrives (e.g. `start_run`, `get_run_progress`).
+2. `OpentronGuiDriver` calls `cua-driver` to **capture a screenshot** of the Opentrons App — in the background, no focus change.
+3. The screenshot goes to **Claude vision** to read state or identify UI elements by SOM number.
+4. Synthesised mouse/keyboard events are dispatched back through `cua-driver`.
 5. The result is returned to PUDA.
+
+---
+
+## Opentrons App Navigation Reference
+
+```
+Left sidebar
+  ├── Protocols   ← home screen; lists all imported protocols
+  ├── Devices     ← shows connected OT-2 robots
+  └── Settings
+
+Protocols tab
+  ├── Import (top-right)      → opens import sidebar → Choose File
+  └── Protocol card ⋮ menu   → Start setup
+
+Setup screen
+  ├── Select robot            → Proceed to setup
+  ├── Robot Calibration
+  ├── Labware Position Check  (optional)
+  └── Start run ──────────────────────────────────────────────┐
+
+Run tab                                                        │◄──
+  ├── Run Preview (live step log)
+  ├── Pause / Resume
+  └── Cancel run
+```
 
 ---
 
 ## Prerequisites
 
-### 1. Install Hermes Agent with computer use
+### 1. Install the Opentrons App
 
-Follow the [Hermes installation guide](https://hermes-agent.nousresearch.com/docs/getting-started/installation), then enable computer use and verify the setup:
+Download from [opentrons.com](https://opentrons.com/ot-2/) and open it. The OT-2 must be connected and visible in the Devices tab.
+
+### 2. Install Hermes Agent with computer use
 
 ```powershell
 hermes computer-use install
 hermes computer-use doctor      # verify — all checks should be green
 ```
 
-`cua-driver` must be on your `PATH`. The doctor output confirms it. The LLM model and API key used for vision analysis are read from your Hermes configuration — no additional credentials are needed in this driver.
+The LLM model and API credentials come from your existing Hermes configuration — no additional setup needed here.
 
-**Windows note:** Grant no special permissions at install time, but if you drive over SSH (not RDP/console), follow the [Windows SSH autostart guide](https://cua.ai/docs/how-to-guides/driver/windows-ssh).
-
-### 2. Python environment (uv)
+### 3. Python environment (uv)
 
 ```powershell
 uv sync
@@ -81,25 +92,19 @@ uv sync
 Copy-Item .env.example .env
 ```
 
-Edit `.env` — only three values are needed:
+Edit `.env`:
 
 | Variable | Description |
 |---|---|
-| `MACHINE_ID` | Unique PUDA machine ID, e.g. `hplc-1` |
+| `MACHINE_ID` | Unique PUDA machine ID, e.g. `ot2-1` |
 | `NATS_SERVERS` | NATS cluster URLs |
-| `TARGET_APP` | **Exact window title** of the instrument software |
-| `CAPTURE_INTERVAL` | Seconds between telemetry status captures (default `30.0`) |
+| `TARGET_APP` | Window title of the Opentrons App (default `Opentrons`) |
+| `ROBOT_NAME` | Display name of the OT-2 in the App's robot list (leave empty to auto-select) |
+| `CAPTURE_INTERVAL` | Seconds between `run_status` telemetry captures (default `15.0`) |
 
-### Finding the exact TARGET_APP name
+### Finding your robot name
 
-`TARGET_APP` must match the **window title** as cua-driver sees it. On Windows:
-
-```powershell
-# List all visible window titles
-Get-Process | Where-Object {$_.MainWindowTitle} | Select-Object MainWindowTitle
-```
-
-Use the title (or a unique prefix) as `TARGET_APP`.
+Open the Opentrons App → **Devices** tab. The robot display name shown there is what goes into `ROBOT_NAME`.
 
 ---
 
@@ -114,99 +119,124 @@ docker compose -f compose.yml up -d --build
 docker compose -f compose.yml logs -f
 ```
 
+The Opentrons App must be **open and visible** on screen before starting the driver.
+
 ---
 
 ## PUDA Commands
 
+### Status & monitoring
+
 | Command | Description |
 |---|---|
-| `status` | Capture screenshot → LLM reads all visible values → JSON status |
-| `capture_screenshot` | Return raw base64 PNG of the target app |
-| `find_and_click` | Describe a UI element; LLM locates + clicks it |
-| `type_text` | Type text, optionally clicking a field first |
-| `press_key` | Send a keyboard shortcut (e.g. `ctrl+s`, `f5`) |
-| `run_gui_step` | Execute one natural-language GUI instruction autonomously |
-| `ask_screen` | Ask the LLM a read-only question about the current screen |
-| `home` | Navigate to the app's main/home screen |
-| `reset` | Send Escape to cancel any in-progress operation |
-| `shutdown` | Close the cua-driver MCP session cleanly |
+| `status` | Screenshot → LLM reads run_status, step, progress, errors, active tab |
+| `get_run_progress` | Detailed read of the Run tab: step, total, description, elapsed time |
+| `capture_screenshot` | Return raw base64 PNG of the Opentrons App |
+| `ask_screen` | Ask the LLM a free-form question about the current screen |
+
+### Navigation
+
+| Command | Description |
+|---|---|
+| `navigate_protocols` | Click Protocols in the left sidebar |
+| `navigate_devices` | Click Devices in the left sidebar |
+| `home` | Go to the Protocols tab (App home screen) |
+
+### Protocol management
+
+| Command | Description |
+|---|---|
+| `get_protocol_list` | List all protocols shown in the Protocols tab |
+| `import_protocol` | Import a `.py` or `.json` protocol file into the App |
+| `start_setup` | Open setup for a named protocol (⋮ → Start setup) |
+
+### Run lifecycle
+
+| Command | Args | Description |
+|---|---|---|
+| `select_robot` | `robot_name` | Choose the OT-2 on the setup screen |
+| `start_run` | — | Click "Start run" to begin the protocol |
+| `pause_run` | — | Pause an active run |
+| `resume_run` | — | Resume a paused run |
+| `cancel_run` | — | Stop the run (with confirmation) |
+
+### Generic
+
+| Command | Description |
+|---|---|
+| `find_and_click` | Click any UI element by plain-English description |
+| `press_key` | Send a keyboard shortcut (e.g. `escape`, `ctrl+s`) |
+| `reset` | Send Escape to dismiss any dialog |
+| `shutdown` | Close the cua-driver MCP session |
 
 ### Telemetry stream
 
-`puda.<MACHINE_ID>.tlm.stream.instrument_status` — published every `CAPTURE_INTERVAL` seconds. The LLM reads the current screenshot and returns all visible instrument values as JSON.
+`puda.<MACHINE_ID>.tlm.stream.run_status` — published every `CAPTURE_INTERVAL` seconds with:
+`run_status`, `current_step`, `total_steps`, `current_step_description`, `protocol_name`, `robot_name`, `elapsed_time`, `errors`, `tab`.
 
-```
-puda machine watch 'puda.<MACHINE_ID>.tlm.stream.>'
-```
-
-### Example CLI usage
-
-```bash
-# Get current instrument status
-puda machine run my-instrument status
-
-# Click a named button
-puda machine run my-instrument find_and_click --description "Start Run button"
-
-# Set a value in a specific field
-puda machine run my-instrument type_text --text "37.5" --field_description "temperature setpoint"
-
-# Send a keyboard shortcut
-puda machine run my-instrument press_key --keys "ctrl+s"
-
-# Ad-hoc natural-language instruction
-puda machine run my-instrument run_gui_step --instruction "Open the File menu and click Export"
-
-# Read-only question about the screen
-puda machine run my-instrument ask_screen --question "Is there an active alarm?"
+```powershell
+puda machine watch 'puda.ot2-1.tlm.stream.>'
 ```
 
 ---
 
-## Customising for a Specific Instrument
+## Example CLI Usage
 
-### 1. Add instrument-specific commands
+```bash
+# Check current state
+puda machine run ot2-1 status
 
-Subclass `GuiDriver` in `driver.py` and add `@command` methods:
+# List imported protocols
+puda machine run ot2-1 get_protocol_list
 
-```python
-class HplcGuiDriver(GuiDriver):
-    @command
-    def start_run(self, method_name: str) -> dict:
-        """Load a method and start an HPLC run."""
-        self.find_and_click("Method dropdown")
-        self.type_text(method_name, "method name field")
-        self.find_and_click("Start Run button")
-        return self.status()
+# Import a new protocol
+puda machine run ot2-1 import_protocol --file_path "C:\protocols\serial_dilution.py"
+
+# Full run sequence
+puda machine run ot2-1 start_setup --protocol_name "Serial Dilution Tutorial"
+puda machine run ot2-1 select_robot
+puda machine run ot2-1 start_run
+
+# Monitor progress
+puda machine run ot2-1 get_run_progress
+
+# Pause and resume
+puda machine run ot2-1 pause_run
+puda machine run ot2-1 resume_run
+
+# Stop
+puda machine run ot2-1 cancel_run
 ```
 
-### 2. Multi-step automation (PUDA protocols)
+---
 
-Chain commands in a PUDA protocol YAML:
+## Example PUDA Protocol
 
 ```yaml
 steps:
-  - machine: hplc-1
-    command: find_and_click
-    params: {description: "New Method button"}
-  - machine: hplc-1
-    command: type_text
-    params: {text: "1.0", field_description: "flow rate mL/min"}
-  - machine: hplc-1
-    command: press_key
-    params: {keys: "return"}
-  - machine: hplc-1
-    command: status
+  - machine: ot2-1
+    command: navigate_protocols
+  - machine: ot2-1
+    command: start_setup
+    params: {protocol_name: "Serial Dilution Tutorial"}
+  - machine: ot2-1
+    command: select_robot
+  - machine: ot2-1
+    command: start_run
+  - machine: ot2-1
+    command: get_run_progress
 ```
 
 ---
 
 ## Troubleshooting
 
-**`cua-driver not found`** — run `hermes computer-use install`, confirm `cua-driver --version` works in a new terminal.
+**`cua-driver not found`** — run `hermes computer-use install`, confirm `cua-driver --version` works.
 
-**No image returned from capture** — the app window may be minimised or off-screen. Ensure it is visible. Run `hermes computer-use doctor` to check Screen Recording permission.
+**No image returned from capture** — the Opentrons App may be minimised. Ensure it is visible on screen. Run `hermes computer-use doctor` to verify Screen Recording permission.
 
-**LLM cannot identify element** — the SOM screenshot may have too many elements. Use descriptive text that matches visible labels in the UI (button text, field labels). Use `capture_screenshot` + manual inspection to see what the LLM sees.
+**LLM cannot identify button** — element descriptions are matched against visible text in the App. Use the exact button label shown in the UI (e.g. "Start run", "Cancel run", "Proceed to setup"). Use `capture_screenshot` + `ask_screen` to inspect the current screen.
 
-**Windows SSH / Session 0** — drive from an RDP or console session directly, or enable the cua-driver autostart scheduled task. See the [Windows SSH guide](https://cua.ai/docs/how-to-guides/driver/windows-ssh).
+**Robot not found during select_robot** — set `ROBOT_NAME` in `.env` to the exact display name shown in the Opentrons App Devices tab, or leave it empty to auto-select the first robot.
+
+**Windows SSH / Session 0** — drive from an RDP or console session, or enable the cua-driver autostart task. See the [Windows SSH guide](https://cua.ai/docs/how-to-guides/driver/windows-ssh).

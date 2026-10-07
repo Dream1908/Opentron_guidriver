@@ -1,13 +1,8 @@
 """
-Main entry point for the GUI driver edge service.
+Main entry point for the Opentrons OT-2 GUI driver edge service.
 
-This service integrates any desktop instrument software into PUDA using
-Hermes computer use (cua-driver) for GUI automation and a vision LLM for
-screen reading — no instrument SDK required.
-
-Configuration is loaded from a .env file (see .env.example).
-The EdgeRunner publishes heartbeats and host health automatically;
-the GuiDriver's @tlm_stream handles instrument status telemetry.
+Controls the Opentrons desktop App via Hermes computer use (cua-driver MCP)
+and Claude vision — no HTTP API or SSH required.
 """
 
 import asyncio
@@ -20,7 +15,7 @@ from puda import EdgeNatsClient, EdgeRunner
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from driver import GuiDriver
+from driver import OpentronGuiDriver
 
 # ── logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -28,7 +23,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     force=True,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)      # suppress Anthropic HTTP noise
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("anthropic").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -36,31 +31,25 @@ logger = logging.getLogger(__name__)
 # ── configuration ──────────────────────────────────────────────────────────
 
 class Config(BaseSettings):
-    """
-    Environment-driven configuration for the GUI driver edge service.
-
-    All fields are read from .env (or real environment variables).
-    Field names are case-insensitive; underscores and hyphens are interchangeable.
-    """
-
     # ── PUDA core ──────────────────────────────────────────────────────────
-    machine_id: str = Field(
-        description="Unique PUDA machine identifier (e.g. 'hplc-1', 'pump-controller')."
-    )
-    nats_servers: str = Field(
-        description="Comma-separated NATS server URLs, e.g. nats://bears:4222."
-    )
+    machine_id: str = Field(description="Unique PUDA machine ID, e.g. 'ot2-1'.")
+    nats_servers: str = Field(description="Comma-separated NATS server URLs.")
 
-    # ── GUI driver ─────────────────────────────────────────────────────────
+    # ── Opentrons GUI driver ───────────────────────────────────────────────
     target_app: str = Field(
+        default="Opentrons",
+        description="Window title of the Opentrons desktop App.",
+    )
+    robot_name: str = Field(
+        default="",
         description=(
-            "Exact window / application name that cua-driver should target, "
-            "e.g. 'Chromeleon', 'ChemStation', 'Xcalibur', 'Notepad'."
-        )
+            "Display name of the OT-2 in the Opentrons App robot list. "
+            "Leave empty to auto-select the first available robot."
+        ),
     )
     capture_interval: float = Field(
-        default=30.0,
-        description="Seconds between automatic instrument_status telemetry snapshots.",
+        default=15.0,
+        description="Seconds between run_status telemetry captures.",
     )
 
     model_config = SettingsConfigDict(
@@ -75,7 +64,6 @@ class Config(BaseSettings):
 
 
 def load_config() -> Config:
-    """Load and validate config; exit the process on failure."""
     try:
         return Config()
     except Exception as e:
@@ -88,21 +76,21 @@ def load_config() -> Config:
 async def main() -> None:
     config = load_config()
 
-    logger.info("=== GUI Driver Configuration ===")
+    logger.info("=== Opentrons GUI Driver ===")
     logger.info("  machine_id   : %s", config.machine_id)
     logger.info("  nats_servers : %s", config.nats_servers)
     logger.info("  target_app   : %s", config.target_app)
+    logger.info("  robot_name   : %s", config.robot_name or "<auto>")
     logger.info("  cap_interval : %.1f s", config.capture_interval)
-    logger.info("================================")
+    logger.info("============================")
 
-    logger.info("Initialising GuiDriver for %r…", config.target_app)
-    driver = GuiDriver(
+    driver = OpentronGuiDriver(
         target_app=config.target_app,
+        robot_name=config.robot_name,
         capture_interval=config.capture_interval,
     )
-    driver.startup()   # connects to cua-driver MCP, lists available tools
+    driver.startup()
 
-    logger.info("Connecting to NATS at %s…", config.nats_servers)
     edge_nats_client = EdgeNatsClient(
         servers=config.nats_server_list,
         machine_id=config.machine_id,
@@ -110,9 +98,8 @@ async def main() -> None:
 
     runner = EdgeRunner(nats_client=edge_nats_client, machine_driver=driver)
     await runner.connect()
-
     logger.info(
-        "==================== %s GUI Edge Service Ready ====================",
+        "==================== %s OT-2 GUI Edge Service Ready ====================",
         config.machine_id,
     )
     await runner.run()
