@@ -43,6 +43,16 @@ class CuaDriverClient:
         self._tools: dict[str, Any] = {}
 
     async def start(self) -> None:
+        import shutil
+        if not shutil.which("cua-driver"):
+            raise RuntimeError(
+                "cua-driver not found on PATH.\n"
+                "Install it via Hermes Agent:\n"
+                "  1. Download Hermes: https://hermes-agent.nousresearch.com\n"
+                "  2. Run: hermes computer-use install\n"
+                "  3. Verify: hermes computer-use doctor\n"
+                "Or set HERMES_CUA_DRIVER_CMD to the full path of your cua-driver binary."
+            )
         params = StdioServerParameters(command="cua-driver", args=["mcp"])
         self._ctx = stdio_client(params)
         read, write = await self._ctx.__aenter__()
