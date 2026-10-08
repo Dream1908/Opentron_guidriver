@@ -108,6 +108,15 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 
 ## PUDA Commands
 
+### Windows input verification
+
+- `click_at(x, y)` takes pixels from the returned screenshot, not desktop/AX coordinates. It validates screenshot bounds, dispatches once in the background, and returns the delivery effect and a fresh screenshot. Inspect that screenshot before any retry.
+- `import_protocol(file_path, upload_x=None, upload_y=None)` uses the current **Upload** label. Supply both optional coordinates from a fresh import-sidebar screenshot when Electron exposes incorrect/off-window AX geometry. Modal Open/Save dialogs take capture priority before typing.
+- Off-window accessibility targets and explicit cua-driver input failures now raise errors instead of silently succeeding. No automatic foreground escalation is performed.
+- `start_run()` reads back the displayed status and returns a screenshot; it no longer assumes a click means the robot is running. An unconfirmed-placement dialog can leave `started=False` and requires explicit handling.
+- Restart the user-managed `main.py` after driver edits to publish the new commands. Do not start duplicate edge instances.
+- Regression tests (no robot motion): `.\\.venv\\Scripts\\python.exe -m unittest discover -s tests -v`.
+
 ### Status & monitoring
 
 | Command | Description |

@@ -7,9 +7,18 @@ with raw screenshot telemetry — no LLM, HTTP API, or SSH required.
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
+
+# PUDA discovers host addresses by reading command output in text mode. Windows
+# otherwise uses the active ANSI code page (commonly cp1252), which cannot decode
+# all UTF-8 output from tools such as `tailscale status --json`. UTF-8 mode is an
+# interpreter-startup setting, so restart once before importing PUDA.
+if os.name == "nt" and not sys.flags.utf8_mode:
+    os.environ["PYTHONUTF8"] = "1"
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 from puda import EdgeNatsClient, EdgeRunner
 from pydantic import Field

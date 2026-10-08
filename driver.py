@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import sys
 import threading
 import time
 from typing import Any
@@ -45,6 +46,7 @@ class CuaDriverClient:
         self._window_id: int | None = None
         self._snapshot_id: str | None = None
         self._last_elements: list[dict[str, Any]] = []
+        self._capture_meta: dict[str, Any] = {}
 
     async def start(self) -> None:
         import shutil
@@ -63,7 +65,10 @@ class CuaDriverClient:
             env={"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
             encoding="utf-8", encoding_error_handler="replace",
         )
-        self._ctx = stdio_client(params)
+        # Pass stderr as bytes. On Windows, a text stderr stream uses the active
+        # ANSI code page (often cp1252); cua-driver may emit UTF-8 bytes that are
+        # invalid in that code page and crash subprocess._readerthread.
+        self._ctx = stdio_client(params, errlog=getattr(sys.stderr, "buffer", sys.stderr))
         read, write = await self._ctx.__aenter__()
         self._session = ClientSession(read, write)
         await self._session.__aenter__()
@@ -116,6 +121,18 @@ class CuaDriverClient:
             )
         return matches
 
+    @classmethod
+    def _require_input(cls, result: Any) -> Any:
+        """Fail closed on rejected/no-op input; unverifiable delivery needs read-back."""
+        structured = cls._structured(result)
+        if (getattr(result, "is_error", False) or getattr(result, "isError", False)
+                or structured.get("ok") is False
+                or structured.get("effect") == "suspected_noop"):
+            raise RuntimeError(
+                f"cua-driver input rejected: {structured or str(getattr(result, 'content', result))}"
+            )
+        return result
+
     async def capture(self, app: str | None = None, mode: str = "screenshot") -> Any:
         tool = self._resolve(self._CAPTURE_TOOLS)
         if tool == "get_window_state":
@@ -124,7 +141,7 @@ class CuaDriverClient:
 
             # Electron can leave a second blank top-level window behind. Inspect
             # every matching window and use the one with the richest UI tree.
-            candidates: list[tuple[int, int, Any, dict[str, Any], int, int]] = []
+            candidates: list[tuple[int, int, int, Any, dict[str, Any], int, int]] = []
             for window in await self._matching_windows(app):
                 pid = int(window["pid"])
                 window_id = int(window["window_id"])
@@ -137,13 +154,16 @@ class CuaDriverClient:
                 structured = self._structured(result)
                 score = int(structured.get("total_element_count", 0))
                 image_size = len(self.extract_image_b64(result) or "")
-                candidates.append((score, image_size, result, structured, pid, window_id))
+                title = str(window.get("title", "")).casefold()
+                modal = int(title in {"open", "save as"} or title.startswith("blob:"))
+                candidates.append((modal, score, image_size, result, structured, pid, window_id))
 
-            _, _, result, structured, self._pid, self._window_id = max(
-                candidates, key=lambda item: (item[0], item[1])
+            _, _, _, result, structured, self._pid, self._window_id = max(
+                candidates, key=lambda item: (item[0], item[1], item[2])
             )
             self._snapshot_id = structured.get("snapshot_id")
             self._last_elements = structured.get("elements", [])
+            self._capture_meta = structured
             return result
 
         args: dict = {"action": "capture", "mode": mode} if tool == "computer_use" else {}
@@ -156,6 +176,7 @@ class CuaDriverClient:
         args: dict = {"action": "click", "button": button} if tool == "computer_use" else {"button": button}
         if tool == "click" and self._pid is not None:
             args["pid"] = self._pid
+            args["window_id"] = self._window_id
         if element is not None:
             if tool == "click":
                 args["element_index"] = element
@@ -167,14 +188,14 @@ class CuaDriverClient:
         elif x is not None and y is not None:
             args["x"] = x
             args["y"] = y
-        return await self._call(tool, args)
+        return self._require_input(await self._call(tool, args))
 
     async def type_text(self, text: str) -> Any:
         tool = self._resolve(self._TYPE_TOOLS)
         args = {"action": "type", "text": text} if tool == "computer_use" else {"text": text}
         if tool == "type_text" and self._pid is not None:
             args.update({"pid": self._pid, "window_id": self._window_id})
-        return await self._call(tool, args)
+        return self._require_input(await self._call(tool, args))
 
     async def key(self, keys: str, capture_after: bool = False) -> Any:
         tool = self._resolve(self._KEY_TOOLS)
@@ -187,7 +208,7 @@ class CuaDriverClient:
                 args.update({"pid": self._pid, "window_id": self._window_id})
         else:
             args = {"keys": keys}
-        return await self._call(tool, args)
+        return self._require_input(await self._call(tool, args))
 
     async def scroll(self, direction: str = "down", amount: int = 3) -> Any:
         tool = self._resolve(self._SCROLL_TOOLS)
@@ -268,6 +289,18 @@ class GuiDriver:
                     candidates.append((score, int(element["element_index"]), label))
             if candidates:
                 _, elem, label = max(candidates, key=lambda item: (item[0], -item[1]))
+                selected = next(e for e in self._cua._last_elements if int(e["element_index"]) == elem)
+                frame = selected.get("frame", {})
+                window = self._cua._capture_meta.get("window_bounds", {})
+                if frame and window:
+                    cx = frame["x"] + frame["w"] / 2
+                    cy = frame["y"] + frame["h"] / 2
+                    if not (window["x"] <= cx < window["x"] + window["width"]
+                            and window["y"] <= cy < window["y"] + window["height"]):
+                        raise RuntimeError(
+                            f"Accessibility coordinates for {description!r} are outside the captured window. "
+                            "Use PUDA click_at with coordinates grounded in the returned screenshot."
+                        )
                 logger.info("accessibility click: element %d (%s) for %r", elem, label, description)
                 self._run(self._cua.click(element=elem))
                 return elem
@@ -308,6 +341,24 @@ class GuiDriver:
     def ask_screen(self, question: str) -> dict:
         """Capture the screen without interpreting it."""
         return {"question": question, "app": self.target_app, "image_b64": self._screenshot()}
+    @command
+    def click_at(self, x: int, y: int) -> dict:
+        """Dispatch a background click using captured screenshot pixels; inspect returned image.
+
+        Use only coordinates grounded in a fresh screenshot, not native AX bounds.
+        No implicit foreground escalation or automatic repeat is performed.
+        """
+        self._screenshot()
+        width = self._cua._capture_meta.get("screenshot_width")
+        height = self._cua._capture_meta.get("screenshot_height")
+        if width is None or height is None or not (0 <= x < width and 0 <= y < height):
+            raise ValueError("Click coordinates must be inside the fresh screenshot")
+        result = self._run(self._cua.click(x=x, y=y))
+        time.sleep(0.5)
+        return {"x": x, "y": y,
+                "effect": CuaDriverClient._structured(result).get("effect", "unverifiable"),
+                "image_b64": self._screenshot()}
+
     @command
     def find_and_click(self, description: str) -> dict:
         """
@@ -426,7 +477,8 @@ class OpentronGuiDriver(GuiDriver):
             bool: True when the click was dispatched.
         """
         logger.info("navigate_protocols")
-        self._run(self._cua.key("escape"))
+        # Background Escape is rejected by this Electron surface. Click the
+        # route directly; verification still fails closed if a modal blocks it.
         self._som_click("Protocols in the left sidebar")
         self._verify_route("protocols")
         return True
@@ -439,7 +491,6 @@ class OpentronGuiDriver(GuiDriver):
             bool: True when the click was dispatched.
         """
         logger.info("navigate_devices")
-        self._run(self._cua.key("escape"))
         self._som_click("Devices in the left sidebar")
         self._verify_route("devices")
         return True
@@ -459,7 +510,8 @@ class OpentronGuiDriver(GuiDriver):
         self.navigate_protocols()
         return {"image_b64": self._screenshot(), "elements": self._cua._last_elements}
     @command
-    def import_protocol(self, file_path: str) -> dict:
+    def import_protocol(self, file_path: str, upload_x: int | None = None,
+                        upload_y: int | None = None) -> dict:
         """
         Import a protocol file into the Opentrons App.
 
@@ -469,22 +521,31 @@ class OpentronGuiDriver(GuiDriver):
         Args:
             file_path: Absolute path to the protocol file (.py or .json),
                        e.g. 'C:\\protocols\\serial_dilution.py'.
+            upload_x: Optional Upload-button X in the fresh screenshot (not AX coordinates).
+            upload_y: Optional Upload-button Y; supply both coordinates together.
 
         Returns:
             dict: {'file_path': str, 'imported': bool, 'message': str}
         """
         logger.info("import_protocol: %s", file_path)
+        if (upload_x is None) != (upload_y is None):
+            raise ValueError("Supply both upload_x and upload_y, or neither")
         self.navigate_protocols()
 
         # Click the Import button (top-right of Protocols tab)
         self._som_click("Import button in the top right corner")
 
-        # The import sidebar opens — click "Choose File" to open the file picker
-        self._som_click("Choose File button in the import sidebar")
+        # Current app calls this Upload. Broken off-window AX coordinates must
+        # be replaced only by explicit, screenshot-grounded pixels, not guesses.
+        time.sleep(0.5)
+        if upload_x is not None:
+            self.click_at(upload_x, upload_y)
+        else:
+            self._som_click("Upload")
 
         # Type the file path directly into the system file picker and confirm
-        import time
         time.sleep(0.5)  # let the file picker open
+        self._screenshot()  # select the modal file dialog before sending text
         self._run(self._cua.type_text(file_path))
         self._run(self._cua.key("return"))
 
@@ -557,9 +618,12 @@ class OpentronGuiDriver(GuiDriver):
         """
         logger.info("start_run")
         self._som_click("Start run button")
-        import time
         time.sleep(1.5)
-        return {"started": True, "run_status": "running"}
+        image = self._screenshot()
+        labels = {str(e.get("label", "")).casefold() for e in self._cua._last_elements}
+        status = next((s for s in ("running", "not started", "paused", "completed", "failed")
+                       if s in labels), "unverified")
+        return {"started": status == "running", "run_status": status, "image_b64": image}
     @command
     def pause_run(self) -> dict:
         """

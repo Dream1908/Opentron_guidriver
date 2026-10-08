@@ -1,0 +1,5 @@
+Picking up tip from A3 of Opentrons OT-2 96 Tip Rack 300 µL on 8
+Aspirating 100.0 uL from A1 of Corning 96 Well Plate 360 µL Flat on 7 at 92.86 uL/sec
+Dispensing 100.0 uL into A1 of Corning 96 Well Plate 360 µL Flat on 9 at 92.86 uL/sec
+Blowing out at A1 of Corning 96 Well Plate 360 µL Flat on 9
+Dropping tip into A1 of Opentrons Fixed Trash on 12
