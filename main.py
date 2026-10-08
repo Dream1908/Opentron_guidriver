@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 
 from puda import EdgeNatsClient, EdgeRunner
-import psutil
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -89,24 +88,9 @@ async def main() -> None:
         machine_id=config.machine_id,
     )
 
-    async def telemetry_handler() -> None:
-        """Publish heartbeat and host health using the pre-0.1 template API."""
-        await edge_nats_client.publish_heartbeat()
-        temperatures = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
-        sensor = next(
-            (values[0] for name in ("coretemp", "cpu_thermal", "k10temp", "acpitz")
-             if (values := temperatures.get(name))),
-            None,
-        )
-        await edge_nats_client.publish_health({
-            "cpu": psutil.cpu_percent(interval=None),
-            "mem": psutil.virtual_memory().percent,
-            "temp": sensor.current if sensor else None,
-        })
     runner = EdgeRunner(
         nats_client=edge_nats_client,
         machine_driver=driver,
-        telemetry_handler=telemetry_handler,
         state_handler=driver._snapshot,
     )
     await runner.connect()

@@ -12,6 +12,7 @@ from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from puda import command
 
 logger = logging.getLogger(__name__)
 
@@ -299,12 +300,15 @@ class GuiDriver:
     # ── base PUDA commands ─────────────────────────────────────────────────
     def _snapshot(self) -> dict:
         return {"target_app": self.target_app, "last_status": self._last_status}
+    @command
     def capture_screenshot(self) -> dict:
         """Return a raw base64 PNG screenshot of the target application."""
         return {"app": self.target_app, "image_b64": self._screenshot()}
+    @command
     def ask_screen(self, question: str) -> dict:
         """Capture the screen without interpreting it."""
         return {"question": question, "app": self.target_app, "image_b64": self._screenshot()}
+    @command
     def find_and_click(self, description: str) -> dict:
         """
         Locate and click an accessibility element by description.
@@ -318,6 +322,7 @@ class GuiDriver:
         logger.info("find_and_click: %r", description)
         elem = self._som_click(description)
         return {"clicked_element": elem, "description": description}
+    @command
     def press_key(self, keys: str) -> dict:
         """
         Press a keyboard shortcut in the target application.
@@ -404,6 +409,7 @@ class OpentronGuiDriver(GuiDriver):
         }
 
     # ── status ─────────────────────────────────────────────────────────────
+    @command
     def status(self) -> dict:
         """Navigate to Devices and return the current Opentrons image."""
         self.navigate_devices()
@@ -411,6 +417,7 @@ class OpentronGuiDriver(GuiDriver):
         return self._last_status
 
     # ── navigation ─────────────────────────────────────────────────────────
+    @command
     def navigate_protocols(self) -> bool:
         """
         Click 'Protocols' in the left sidebar to go to the Protocols tab.
@@ -423,6 +430,7 @@ class OpentronGuiDriver(GuiDriver):
         self._som_click("Protocols in the left sidebar")
         self._verify_route("protocols")
         return True
+    @command
     def navigate_devices(self) -> bool:
         """
         Click 'Devices' in the left sidebar to go to the Devices / robot list tab.
@@ -445,10 +453,12 @@ class OpentronGuiDriver(GuiDriver):
         return self.navigate_protocols()
 
     # ── protocol management ────────────────────────────────────────────────
+    @command
     def get_protocol_list(self) -> dict:
         """Return a Protocols-tab screenshot and accessibility elements."""
         self.navigate_protocols()
         return {"image_b64": self._screenshot(), "elements": self._cua._last_elements}
+    @command
     def import_protocol(self, file_path: str) -> dict:
         """
         Import a protocol file into the Opentrons App.
@@ -483,6 +493,7 @@ class OpentronGuiDriver(GuiDriver):
         return {"file_path": file_path, "image_b64": self._screenshot()}
 
     # ── run lifecycle ──────────────────────────────────────────────────────
+    @command
     def start_setup(self, protocol_name: str) -> dict:
         """
         Open the setup screen for a protocol by clicking its three-dot (⋮) menu
@@ -506,6 +517,7 @@ class OpentronGuiDriver(GuiDriver):
         import time
         time.sleep(1.0)
         return {"protocol_name": protocol_name, "setup_opened": True}
+    @command
     def select_robot(self, robot_name: str = "") -> dict:
         """
         Select the OT-2 robot on the setup screen.
@@ -532,6 +544,7 @@ class OpentronGuiDriver(GuiDriver):
         time.sleep(0.5)
         self._som_click("Proceed to setup button")
         return {"robot_name": name, "selected": True}
+    @command
     def start_run(self) -> dict:
         """
         Click 'Start run' on the Run tab to begin executing the protocol.
@@ -547,6 +560,7 @@ class OpentronGuiDriver(GuiDriver):
         import time
         time.sleep(1.5)
         return {"started": True, "run_status": "running"}
+    @command
     def pause_run(self) -> dict:
         """
         Pause the currently running protocol.
@@ -559,6 +573,7 @@ class OpentronGuiDriver(GuiDriver):
         import time
         time.sleep(0.5)
         return {"paused": True}
+    @command
     def resume_run(self) -> dict:
         """
         Resume a paused protocol run.
@@ -571,6 +586,7 @@ class OpentronGuiDriver(GuiDriver):
         import time
         time.sleep(0.5)
         return {"resumed": True}
+    @command
     def cancel_run(self) -> dict:
         """
         Cancel (stop) the current protocol run.
@@ -593,6 +609,7 @@ class OpentronGuiDriver(GuiDriver):
         return {"cancelled": True, "image_b64": self._screenshot()}
 
     # ── run monitoring ─────────────────────────────────────────────────────
+    @command
     def get_run_progress(self) -> dict:
         """Return the current Run-tab screenshot without analysis."""
         return {"target_app": self.target_app, "image_b64": self._screenshot()}

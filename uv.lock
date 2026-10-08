@@ -367,15 +367,16 @@ wheels = [
 
 [[package]]
 name = "puda"
-version = "0.0.16"
+version = "0.0.18"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "nats-py" },
+    { name = "psutil" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6f/a2/b2074cad7dee37c6faad324c82a9fd09fb87a96c0b5c9e69250efd0f9ddd/puda-0.0.16.tar.gz", hash = "sha256:fac59addb7bda9fd53041f5e96cd2e47cd119d9c0097684a9735679dc2bc9821", size = 31773, upload-time = "2026-07-09T05:25:33.927Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4b/90/07342df728d6c8623a7b0f10eec9c99e1392cfef098f6d8db6d193c89ac4/puda-0.0.18.tar.gz", hash = "sha256:4280723e0d43d22107f6e5b8d39edeeecbeb5c167c436a5f55154506085dbe93", size = 43553, upload-time = "2026-09-30T07:33:14.956Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/41/2779251fb46687d21f0d0804bcc968c02d67535f69f88903062225b1ae79/puda-0.0.16-py3-none-any.whl", hash = "sha256:ba6046a78effb90b04af40e6e299ae35a29e12264104830edd4c5d198b6e3578", size = 36705, upload-time = "2026-07-09T05:25:35.226Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/53/5bd93db3d65c7d17774d3c717dfee4e5148b1c607eb1f4dfb277f4c3d1cb/puda-0.0.18-py3-none-any.whl", hash = "sha256:5819f5cd096143a8a06bb67262fbeac6f5fcc56ad2d16fc67e5479a947c4109b", size = 49151, upload-time = "2026-09-30T07:33:13.498Z" },
 ]
 
 [[package]]
@@ -384,7 +385,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "mcp" },
-    { name = "psutil" },
     { name = "puda" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -394,8 +394,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = ">=1.0.0" },
-    { name = "psutil", specifier = ">=6.1.1" },
-    { name = "puda", specifier = "==0.0.16" },
+    { name = "puda", specifier = "==0.0.18" },
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pydantic-settings", specifier = ">=2.12.0" },
     { name = "python-dotenv", specifier = ">=1.2.1" },

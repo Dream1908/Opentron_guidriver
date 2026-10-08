@@ -5,19 +5,19 @@ A PUDA edge service that integrates the **Opentrons OT-2** liquid-handling robot
 | Layer | Technology | Role |
 |---|---|---|
 | GUI automation | `cua-driver` MCP | Capture the App and dispatch accessibility or keyboard actions |
-| PUDA integration | PUDA SDK `0.0.16` + NATS | Expose public methods through the pre-0.1 edge contract |
+| PUDA integration | PUDA SDK `0.0.18` + NATS | Expose allowlisted commands through the PUDA 0.1.x edge contract |
 
 ---
 
 ## How It Works
 
-This project follows the pre-0.1 structure from `PUDAP/edge-python-template` before commit `f75c5c4` introduced decorators:
+This project follows the PUDA 0.1.x edge contract:
 
-1. `EdgeRunner` discovers documented public driver methods as commands.
+1. Only driver methods marked with `@command` are remotely callable.
 2. Internal helpers, startup, cached state, and telemetry methods use a leading underscore.
-3. `main.py` supplies `telemetry_handler` and `state_handler` explicitly.
+3. `EdgeRunner` publishes heartbeat and host-health telemetry; `main.py` supplies the instrument state handler.
 4. Screens are returned as raw base64 PNG data. No LLM analyzes them.
-5. There are no decorator-based command, safety, state, or telemetry registrations.
+5. Command signatures and docstrings are published in the structured command catalog.
 
 ---
 
@@ -154,7 +154,7 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 
 ### Telemetry
 
-The pre-0.1 telemetry handler explicitly publishes heartbeat and host-health data. Screenshot status is fetched on demand with `status`, `capture_screenshot`, or `get_run_progress`.
+`EdgeRunner` publishes heartbeat and host-health data. Screenshot status is fetched on demand with `status`, `capture_screenshot`, or `get_run_progress`.
 
 ---
 
