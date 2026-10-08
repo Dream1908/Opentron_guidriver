@@ -2,7 +2,7 @@
 Main entry point for the Opentrons OT-2 GUI driver edge service.
 
 Controls the Opentrons desktop App via Hermes computer use (cua-driver MCP)
-and Claude vision — no HTTP API or SSH required.
+with raw screenshot telemetry — no LLM, HTTP API, or SSH required.
 """
 
 import asyncio
@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 from puda import EdgeNatsClient, EdgeRunner
+import psutil
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -24,7 +25,6 @@ logging.basicConfig(
     force=True,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("anthropic").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -47,11 +47,6 @@ class Config(BaseSettings):
             "Leave empty to auto-select the first available robot."
         ),
     )
-    capture_interval: float = Field(
-        default=15.0,
-        description="Seconds between run_status telemetry captures.",
-    )
-
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parent / ".env",
         env_file_encoding="utf-8",
@@ -81,22 +76,39 @@ async def main() -> None:
     logger.info("  nats_servers : %s", config.nats_servers)
     logger.info("  target_app   : %s", config.target_app)
     logger.info("  robot_name   : %s", config.robot_name or "<auto>")
-    logger.info("  cap_interval : %.1f s", config.capture_interval)
     logger.info("============================")
 
     driver = OpentronGuiDriver(
         target_app=config.target_app,
         robot_name=config.robot_name,
-        capture_interval=config.capture_interval,
     )
-    driver.startup()
+    driver._startup()
 
     edge_nats_client = EdgeNatsClient(
         servers=config.nats_server_list,
         machine_id=config.machine_id,
     )
 
-    runner = EdgeRunner(nats_client=edge_nats_client, machine_driver=driver)
+    async def telemetry_handler() -> None:
+        """Publish heartbeat and host health using the pre-0.1 template API."""
+        await edge_nats_client.publish_heartbeat()
+        temperatures = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
+        sensor = next(
+            (values[0] for name in ("coretemp", "cpu_thermal", "k10temp", "acpitz")
+             if (values := temperatures.get(name))),
+            None,
+        )
+        await edge_nats_client.publish_health({
+            "cpu": psutil.cpu_percent(interval=None),
+            "mem": psutil.virtual_memory().percent,
+            "temp": sensor.current if sensor else None,
+        })
+    runner = EdgeRunner(
+        nats_client=edge_nats_client,
+        machine_driver=driver,
+        telemetry_handler=telemetry_handler,
+        state_handler=driver._snapshot,
+    )
     await runner.connect()
     logger.info(
         "==================== %s OT-2 GUI Edge Service Ready ====================",

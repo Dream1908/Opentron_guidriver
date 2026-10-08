@@ -1,18 +1,17 @@
 [project]
 name = "puda-guidriver"
 version = "0.1.0"
-description = "PUDA GUI driver — controls any desktop instrument software via Hermes computer use (cua-driver MCP + vision LLM)"
+description = "PUDA GUI driver — controls any desktop instrument software via Hermes computer use (cua-driver MCP)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # PUDA edge framework
-    "puda>=0.0.18",
+    "puda==0.0.16",
     # Settings / config
     "pydantic>=2.12.5",
     "pydantic-settings>=2.12.0",
     "python-dotenv>=1.2.1",
+    "psutil>=6.1.1",
     # MCP client — talks to cua-driver stdio server
     "mcp>=1.0.0",
-    # Vision LLM — Claude for screenshot analysis
-    "anthropic>=0.49.0",
 ]

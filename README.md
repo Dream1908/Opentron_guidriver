@@ -4,36 +4,20 @@ A PUDA edge service that integrates the **Opentrons OT-2** liquid-handling robot
 
 | Layer | Technology | Role |
 |---|---|---|
-| GUI automation | [Hermes computer use](https://hermes-agent.nousresearch.com/docs/user-guide/features/computer-use) → `cua-driver` MCP | Background click / type / key dispatch in the Opentrons App |
-| Vision reading | Claude vision via Hermes model config | Read run status, step progress, errors from screenshots |
-| PUDA integration | `puda` `EdgeRunner` + NATS | Expose commands and telemetry to the PUDA platform |
+| GUI automation | `cua-driver` MCP | Capture the App and dispatch accessibility or keyboard actions |
+| PUDA integration | PUDA SDK `0.0.16` + NATS | Expose public methods through the pre-0.1 edge contract |
 
 ---
 
 ## How It Works
 
-```
-PUDA CLI / Protocol
-       │  NATS
-       ▼
-  EdgeRunner  ──────────────────────────►  OpentronGuiDriver (@command methods)
-                                                  │
-                           ┌───────────────────────┤
-                           │                       │
-                     cua-driver MCP          Claude vision
-                    (GUI automation)     (via Hermes model config)
-                           │                       │
-                     ┌─────▼──────────┐  ┌─────────▼────────────┐
-                     │ Opentrons App  │  │  Extract run status / │
-                     │ (desktop UI)   │──►  plan GUI actions     │
-                     └────────────────┘  └──────────────────────┘
-```
+This project follows the pre-0.1 structure from `PUDAP/edge-python-template` before commit `f75c5c4` introduced decorators:
 
-1. A PUDA command arrives (e.g. `start_run`, `get_run_progress`).
-2. `OpentronGuiDriver` calls `cua-driver` to **capture a screenshot** of the Opentrons App — in the background, no focus change.
-3. The screenshot goes to **Claude vision** to read state or identify UI elements by SOM number.
-4. Synthesised mouse/keyboard events are dispatched back through `cua-driver`.
-5. The result is returned to PUDA.
+1. `EdgeRunner` discovers documented public driver methods as commands.
+2. Internal helpers, startup, cached state, and telemetry methods use a leading underscore.
+3. `main.py` supplies `telemetry_handler` and `state_handler` explicitly.
+4. Screens are returned as raw base64 PNG data. No LLM analyzes them.
+5. There are no decorator-based command, safety, state, or telemetry registrations.
 
 ---
 
@@ -100,7 +84,6 @@ Edit `.env`:
 | `NATS_SERVERS` | NATS cluster URLs |
 | `TARGET_APP` | Window title of the Opentrons App (default `Opentrons`) |
 | `ROBOT_NAME` | Display name of the OT-2 in the App's robot list (leave empty to auto-select) |
-| `CAPTURE_INTERVAL` | Seconds between `run_status` telemetry captures (default `15.0`) |
 
 ### Finding your robot name
 
@@ -129,10 +112,10 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 
 | Command | Description |
 |---|---|
-| `status` | Screenshot → LLM reads run_status, step, progress, errors, active tab |
-| `get_run_progress` | Detailed read of the Run tab: step, total, description, elapsed time |
-| `capture_screenshot` | Return raw base64 PNG of the Opentrons App |
-| `ask_screen` | Ask the LLM a free-form question about the current screen |
+| `status` | Return the current raw screenshot as base64 PNG |
+| `get_run_progress` | Return the current Run-tab screenshot without interpretation |
+| `capture_screenshot` | Return a raw base64 PNG of the Opentrons App |
+| `ask_screen` | Return a raw screenshot together with the supplied question |
 
 ### Navigation
 
@@ -146,9 +129,9 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 
 | Command | Description |
 |---|---|
-| `get_protocol_list` | List all protocols shown in the Protocols tab |
+| `get_protocol_list` | Return the Protocols-tab screenshot and accessibility elements |
 | `import_protocol` | Import a `.py` or `.json` protocol file into the App |
-| `start_setup` | Open setup for a named protocol (⋮ → Start setup) |
+| `start_setup` | Open setup for a named protocol |
 
 ### Run lifecycle
 
@@ -169,14 +152,9 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 | `reset` | Send Escape to dismiss any dialog |
 | `shutdown` | Close the cua-driver MCP session |
 
-### Telemetry stream
+### Telemetry
 
-`puda.<MACHINE_ID>.tlm.stream.run_status` — published every `CAPTURE_INTERVAL` seconds with:
-`run_status`, `current_step`, `total_steps`, `current_step_description`, `protocol_name`, `robot_name`, `elapsed_time`, `errors`, `tab`.
-
-```powershell
-puda machine watch 'puda.ot2-1.tlm.stream.>'
-```
+The pre-0.1 telemetry handler explicitly publishes heartbeat and host-health data. Screenshot status is fetched on demand with `status`, `capture_screenshot`, or `get_run_progress`.
 
 ---
 
