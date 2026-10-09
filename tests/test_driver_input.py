@@ -9,6 +9,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from driver import CuaDriverClient, GuiDriver, OpentronGuiDriver
 
 class DriverInputTests(unittest.TestCase):
+    def test_status_navigates_to_devices_and_returns_current_image(self):
+        driver = object.__new__(OpentronGuiDriver)
+        driver.target_app = 'Opentrons'
+        driver._last_status = {}
+        events = []
+        driver.navigate_devices = lambda: events.append('navigate_devices') or True
+        driver._screenshot = lambda: events.append('screenshot') or 'current-image'
+
+        result = driver.status()
+
+        self.assertEqual(events, ['navigate_devices', 'screenshot'])
+        self.assertEqual(result, {
+            'target_app': 'Opentrons',
+            'image_b64': 'current-image',
+        })
+        self.assertIs(result, driver._last_status)
+
     def test_navigation_works_without_background_escape(self):
         for route in ('protocols', 'devices'):
             with self.subTest(route=route):
@@ -23,6 +40,26 @@ class DriverInputTests(unittest.TestCase):
                 self.assertTrue(getattr(driver, 'navigate_' + route)())
                 self.assertEqual(events, [('click', route.capitalize() + ' in the left sidebar'),
                                           ('verified', route)])
+
+    def test_route_verification_rejects_nested_protocol_detail(self):
+        driver = object.__new__(GuiDriver)
+        driver._cua = SimpleNamespace(_last_elements=[])
+        captures = iter([
+            'file:///app/index.html#/protocols/detail-id',
+            'file:///app/index.html#/protocols',
+        ])
+
+        def screenshot(**kwargs):
+            current = next(captures)
+            driver._cua._last_elements = [
+                {'role': 'Link', 'value': 'file:///app/index.html#/protocols'},
+                {'role': 'Document', 'value': current},
+            ]
+            return 'image'
+
+        driver._screenshot = screenshot
+        with patch('driver.time.sleep'):
+            driver._verify_route('protocols')
 
     def test_start_run_does_not_claim_motion_when_confirmation_is_pending(self):
         driver = object.__new__(OpentronGuiDriver)
@@ -40,28 +77,50 @@ class DriverInputTests(unittest.TestCase):
         self.assertIn('upload_x',inspect.signature(OpentronGuiDriver.import_protocol).parameters,
                       'Import lacks a screenshot-grounded Upload fallback')
         driver = object.__new__(OpentronGuiDriver)
+        driver.target_app = 'Opentrons OT-2'
         events = []
         driver.navigate_protocols = lambda: events.append('navigate')
         driver._som_click = lambda description: events.append(description)
         driver.click_at = lambda x,y: events.append(('pixel',x,y))
         driver._screenshot = lambda **kwargs: events.append('capture') or 'image'
-        async def type_text(text): events.append(('type',text))
-        async def key(keys): events.append(('key',keys))
-        driver._cua = SimpleNamespace(type_text=type_text,key=key)
+        async def type_text(text, **kwargs): events.append(('type',text,kwargs))
+        async def key(keys, **kwargs): events.append(('key',keys,kwargs))
+        window_states = iter([
+            [{'title': 'Open'}],
+            [{'title': 'Opentrons OT-2'}],
+        ])
+        async def matching_windows(app): return next(window_states)
+        driver._cua = SimpleNamespace(
+            type_text=type_text, key=key, _last_elements=[], _tools={},
+            _matching_windows=matching_windows,
+        )
         driver._run = asyncio.run
         with patch('driver.time.sleep'):
             driver.import_protocol(str(Path(__file__).resolve()), upload_x=764, upload_y=309)
         self.assertIn(('pixel',764,309),events)
         self.assertNotIn('Choose File button in the import sidebar',events)
-        self.assertLess(events.index('capture'),events.index(('type',str(Path(__file__).resolve()))))
+        typed = ('type', str(Path(__file__).resolve()), {'delivery_mode': 'foreground'})
+        self.assertLess(events.index('capture'), events.index(typed))
+        self.assertIn(('key', 'return', {'delivery_mode': 'foreground'}), events)
 
     def test_file_dialog_is_selected_instead_of_richer_main_window(self):
         client = CuaDriverClient()
-        client._tools = {'get_window_state':object()}
+        client._tools = {
+            'get_window_state': object(), 'get_screen_size': object(),
+            'set_window_frame': object(), 'bring_to_front': object(),
+        }
         async def windows(app):
-            return [{'pid':1,'window_id':10,'title':'Opentrons OT-2'},
-                    {'pid':1,'window_id':20,'title':'Open'}]
+            visible = {'bounds': {'x': 0, 'y': 0, 'width': 900, 'height': 700},
+                       'is_on_screen': True, 'minimized': False}
+            return [dict(visible, pid=1,window_id=10,title='Opentrons OT-2'),
+                    dict(visible, pid=1,window_id=20,title='Open')]
         async def call(tool,args):
+            if tool == 'get_screen_size':
+                return SimpleNamespace(structured_content={'width':1920,'height':1080})
+            if tool == 'bring_to_front':
+                return SimpleNamespace(structured_content={'now_fg_hwnd':args['window_id']})
+            if tool == 'list_windows':
+                return SimpleNamespace(structured_content={'windows':await windows('Opentrons')})
             is_main = args['window_id']==10
             return SimpleNamespace(structured_content={'total_element_count':100 if is_main else 10,
                                                         'elements':[],'snapshot_id':'s00000001'}, content=[])
@@ -92,7 +151,7 @@ class DriverInputTests(unittest.TestCase):
         driver._screenshot = lambda **kwargs: next(images)
         driver._run = asyncio.run
         result = driver.click_at(764,309)
-        self.assertEqual(calls,[{'x':764,'y':309}])
+        self.assertEqual(calls,[{'x':764,'y':309,'delivery_mode':'foreground'}])
         self.assertEqual(result['effect'],'unverifiable')
         self.assertEqual(result['image_b64'],'after')
 
@@ -116,7 +175,49 @@ class DriverInputTests(unittest.TestCase):
         client._call = call
         asyncio.run(client.click(x=764, y=309))
         self.assertEqual(calls[0][1].get('window_id'), 2820286)
+        self.assertEqual(calls[0][1].get('delivery_mode'), 'foreground')
         self.assertEqual((calls[0][1]['x'], calls[0][1]['y']), (764,309))
+
+    def test_offscreen_window_is_restored_and_foregrounded_before_capture(self):
+        client = CuaDriverClient()
+        client._tools = {
+            'get_window_state': object(), 'get_screen_size': object(),
+            'set_window_frame': object(), 'bring_to_front': object(),
+        }
+        original = {
+            'pid': 42, 'window_id': 99, 'title': 'Opentrons OT-2',
+            'bounds': {'x': -32000, 'y': -32000, 'width': 144, 'height': 28},
+            'is_on_screen': False, 'minimized': True,
+        }
+        restored = dict(original,
+            bounds={'x': 0, 'y': 0, 'width': 1000, 'height': 700},
+            is_on_screen=True, minimized=False)
+        calls = []
+        async def windows(app): return [original]
+        async def call(tool, args):
+            calls.append((tool, args))
+            if tool == 'get_screen_size':
+                return SimpleNamespace(structured_content={'width':1920,'height':1200})
+            if tool == 'list_windows':
+                return SimpleNamespace(structured_content={'windows':[restored]})
+            if tool == 'get_window_state':
+                return SimpleNamespace(structured_content={
+                    'total_element_count':1, 'elements':[], 'snapshot_id':'fresh'},
+                    content=[])
+            return SimpleNamespace(structured_content={'ok':True})
+        client._matching_windows, client._call = windows, call
+
+        asyncio.run(client.capture('Opentrons'))
+
+        names = [name for name, _ in calls]
+        first_front = names.index('bring_to_front')
+        frame_index = names.index('set_window_frame')
+        second_front = names.index('bring_to_front', first_front + 1)
+        self.assertLess(first_front, frame_index)
+        self.assertLess(frame_index, second_front)
+        self.assertLess(second_front, names.index('get_window_state'))
+        frame = next(args for name, args in calls if name == 'set_window_frame')
+        self.assertEqual((frame['x'], frame['y']), (0, 0))
 
     def test_off_window_accessibility_element_is_rejected_before_click(self):
         driver = object.__new__(GuiDriver)

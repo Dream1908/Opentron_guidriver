@@ -105,21 +105,80 @@ class CuaDriverClient:
         return value if isinstance(value, dict) else {}
 
     async def _matching_windows(self, app: str) -> list[dict[str, Any]]:
-        result = await self._call("list_windows", {"on_screen_only": True})
+        # Include minimized/off-screen windows so they can be restored onto the
+        # user's primary display instead of being controlled invisibly.
+        result = await self._call("list_windows", {"on_screen_only": False})
         windows = self._structured(result).get("windows", [])
         needle = app.casefold()
         matches = [
             window for window in windows
             if (needle in str(window.get("app_name", "")).casefold()
                 or needle in str(window.get("title", "")).casefold())
-            and not window.get("minimized", False)
         ]
         if not matches:
             raise RuntimeError(
-                f"No visible, non-minimized window matching {app!r}. "
+                f"No window matching {app!r}. "
                 "Open the Opentrons App in the logged-in desktop session."
             )
         return matches
+
+    async def _make_window_visible(self, window: dict[str, Any]) -> dict[str, Any]:
+        """Restore an exact window to the primary display and foreground it."""
+        required = {"get_screen_size", "set_window_frame", "bring_to_front"}
+        missing = required - self._tools.keys()
+        if missing:
+            raise RuntimeError(
+                "Visible foreground control is unavailable; cua-driver is missing "
+                + ", ".join(sorted(missing))
+            )
+
+        pid = int(window["pid"])
+        window_id = int(window["window_id"])
+        bounds = window.get("bounds", {})
+        screen = self._structured(await self._call("get_screen_size", {}))
+        screen_width = int(screen.get("width", 0))
+        screen_height = int(screen.get("height", 0))
+        if not screen_width or not screen_height:
+            raise RuntimeError("Could not determine the primary display size")
+
+        x = int(bounds.get("x", 0))
+        y = int(bounds.get("y", 0))
+        width = int(bounds.get("width", 0))
+        height = int(bounds.get("height", 0))
+        intersects_primary = (
+            width > 0 and height > 0 and x < screen_width and y < screen_height
+            and x + width > 0 and y + height > 0
+        )
+        needs_reposition = (
+            window.get("minimized", False)
+            or not window.get("is_on_screen", False)
+            or not intersects_primary
+        )
+        # Windows cannot resize a minimized HWND. Restore/activate it first,
+        # then place it on the primary display and reaffirm foreground focus.
+        await self._call("bring_to_front", {"pid": pid, "window_id": window_id})
+        if needs_reposition:
+            width = min(max(width, 1000), screen_width)
+            height = min(max(height, 700), screen_height)
+            await self._call("set_window_frame", {
+                "pid": pid, "window_id": window_id, "x": 0, "y": 0,
+                "width": width, "height": height,
+            })
+            await self._call("bring_to_front", {"pid": pid, "window_id": window_id})
+
+        refreshed = self._structured(
+            await self._call("list_windows", {"on_screen_only": False})
+        ).get("windows", [])
+        exact = next(
+            (item for item in refreshed if int(item.get("window_id", -1)) == window_id),
+            None,
+        )
+        if not exact or exact.get("minimized", False) or not exact.get("is_on_screen", False):
+            raise RuntimeError(
+                f"Refusing GUI input: {window.get('title', 'target window')!r} "
+                "could not be made visible on the user's screen"
+            )
+        return exact
 
     @classmethod
     def _require_input(cls, result: Any) -> Any:
@@ -143,6 +202,7 @@ class CuaDriverClient:
             # every matching window and use the one with the richest UI tree.
             candidates: list[tuple[int, int, int, Any, dict[str, Any], int, int]] = []
             for window in await self._matching_windows(app):
+                window = await self._make_window_visible(window)
                 pid = int(window["pid"])
                 window_id = int(window["window_id"])
                 result = await self._call(tool, {
@@ -171,12 +231,15 @@ class CuaDriverClient:
             args["app"] = app
         return await self._call(tool, args)
     async def click(self, element: int | None = None, x: int | None = None,
-                    y: int | None = None, button: str = "left") -> Any:
+                    y: int | None = None, button: str = "left",
+                    delivery_mode: str | None = "foreground") -> Any:
         tool = self._resolve(self._CLICK_TOOLS)
         args: dict = {"action": "click", "button": button} if tool == "computer_use" else {"button": button}
         if tool == "click" and self._pid is not None:
             args["pid"] = self._pid
             args["window_id"] = self._window_id
+            if delivery_mode:
+                args["delivery_mode"] = delivery_mode
         if element is not None:
             if tool == "click":
                 args["element_index"] = element
@@ -190,14 +253,31 @@ class CuaDriverClient:
             args["y"] = y
         return self._require_input(await self._call(tool, args))
 
-    async def type_text(self, text: str) -> Any:
+    async def type_text(self, text: str, delivery_mode: str | None = "foreground") -> Any:
         tool = self._resolve(self._TYPE_TOOLS)
         args = {"action": "type", "text": text} if tool == "computer_use" else {"text": text}
         if tool == "type_text" and self._pid is not None:
             args.update({"pid": self._pid, "window_id": self._window_id})
+            if delivery_mode:
+                args["delivery_mode"] = delivery_mode
         return self._require_input(await self._call(tool, args))
 
-    async def key(self, keys: str, capture_after: bool = False) -> Any:
+    async def set_value(self, element: int, value: str) -> Any:
+        """Set a native UIA value using the current captured-window snapshot."""
+        if "set_value" not in self._tools:
+            raise RuntimeError("cua-driver does not expose set_value")
+        args: dict[str, Any] = {
+            "pid": self._pid,
+            "window_id": self._window_id,
+            "element_index": element,
+            "value": value,
+        }
+        if self._snapshot_id:
+            args["snapshot_id"] = self._snapshot_id
+        return self._require_input(await self._call("set_value", args))
+
+    async def key(self, keys: str, capture_after: bool = False,
+                  delivery_mode: str | None = "foreground") -> Any:
         tool = self._resolve(self._KEY_TOOLS)
         if tool == "computer_use":
             args = {"action": "key", "keys": keys, "capture_after": capture_after}
@@ -206,6 +286,8 @@ class CuaDriverClient:
             args = {"key": parts[-1], "modifiers": parts[:-1]}
             if self._pid is not None:
                 args.update({"pid": self._pid, "window_id": self._window_id})
+                if delivery_mode:
+                    args["delivery_mode"] = delivery_mode
         else:
             args = {"keys": keys}
         return self._require_input(await self._call(tool, args))
@@ -321,15 +403,20 @@ class GuiDriver:
 
     def _verify_route(self, route: str) -> None:
         """Refresh the UI tree and fail unless the Electron URL is on route."""
-        expected = f"#/{route.lstrip('/')}"
+        expected = f"/{route.strip('/')}"
         for attempt in range(5):
             self._screenshot(mode="som")
-            values = [str(element.get("value", "")) for element in self._cua._last_elements]
-            if any(expected in value for value in values):
+            values = [
+                str(element.get("value", ""))
+                for element in self._cua._last_elements
+                if str(element.get("role", "")).casefold() == "document"
+            ]
+            fragments = [value.split("#", 1)[1].rstrip("/") for value in values if "#" in value]
+            if expected in fragments:
                 return
             if attempt < 4:
                 time.sleep(0.25)
-        raise RuntimeError(f"Opentrons navigation did not reach {expected}")
+        raise RuntimeError(f"Opentrons navigation did not reach #{expected}")
     # ── base PUDA commands ─────────────────────────────────────────────────
     def _snapshot(self) -> dict:
         return {"target_app": self.target_app, "last_status": self._last_status}
@@ -343,17 +430,18 @@ class GuiDriver:
         return {"question": question, "app": self.target_app, "image_b64": self._screenshot()}
     @command
     def click_at(self, x: int, y: int) -> dict:
-        """Dispatch a background click using captured screenshot pixels; inspect returned image.
+        """Dispatch a visible foreground click using fresh screenshot pixels.
 
         Use only coordinates grounded in a fresh screenshot, not native AX bounds.
-        No implicit foreground escalation or automatic repeat is performed.
+        The target window is restored to the primary display and foregrounded.
+        No automatic repeat is performed.
         """
         self._screenshot()
         width = self._cua._capture_meta.get("screenshot_width")
         height = self._cua._capture_meta.get("screenshot_height")
         if width is None or height is None or not (0 <= x < width and 0 <= y < height):
             raise ValueError("Click coordinates must be inside the fresh screenshot")
-        result = self._run(self._cua.click(x=x, y=y))
+        result = self._run(self._cua.click(x=x, y=y, delivery_mode="foreground"))
         time.sleep(0.5)
         return {"x": x, "y": y,
                 "effect": CuaDriverClient._structured(result).get("effect", "unverifiable"),
@@ -480,7 +568,23 @@ class OpentronGuiDriver(GuiDriver):
         # Background Escape is rejected by this Electron surface. Click the
         # route directly; verification still fails closed if a modal blocks it.
         self._som_click("Protocols in the left sidebar")
-        self._verify_route("protocols")
+        try:
+            self._verify_route("protocols")
+        except RuntimeError:
+            # On protocol-detail pages the already-selected sidebar link can
+            # be an Electron no-op. Prefer the exact-route breadcrumb exposed
+            # farther right in the fresh accessibility snapshot.
+            self._screenshot(mode="som")
+            links = [
+                element for element in self._cua._last_elements
+                if str(element.get("role", "")).casefold() in {"link", "hyperlink"}
+                and str(element.get("value", "")).split("#", 1)[-1].rstrip("/") == "/protocols"
+            ]
+            if not links:
+                raise
+            breadcrumb = max(links, key=lambda element: element.get("frame", {}).get("x", 0))
+            self._run(self._cua.click(element=int(breadcrumb["element_index"])))
+            self._verify_route("protocols")
         return True
     @command
     def navigate_devices(self) -> bool:
@@ -543,14 +647,82 @@ class OpentronGuiDriver(GuiDriver):
         else:
             self._som_click("Upload")
 
+        time.sleep(0.5)
+        windows = self._run(self._cua._matching_windows(self.target_app))
+        if not any(str(window.get("title", "")).casefold() == "open" for window in windows):
+            if upload_x is None:
+                raise RuntimeError(
+                    "Upload did not open the file dialog; provide screenshot-grounded upload_x/upload_y"
+                )
+
+            # Read-back proved that Electron dropped one of the background
+            # clicks. Re-open Import and retry the two explicitly authorized
+            # controls with foreground delivery, then verify the native dialog.
+            self.navigate_protocols()
+            self._screenshot(mode="som")
+            imports = [
+                element for element in self._cua._last_elements
+                if str(element.get("role", "")).casefold() == "button"
+                and str(element.get("label", "")).casefold() == "import"
+            ]
+            if not imports:
+                raise RuntimeError("Import button is not available on the Protocols list")
+            frame = imports[0].get("frame", {})
+            bounds = self._cua._capture_meta.get("window_bounds", {})
+            if not frame or not bounds:
+                raise RuntimeError("Import button has no screenshot-grounded frame")
+            import_x = int(frame["x"] - bounds["x"] + frame["w"] / 2)
+            import_y = int(frame["y"] - bounds["y"] + frame["h"] / 2)
+            self._run(self._cua.click(
+                x=import_x, y=import_y, delivery_mode="foreground"
+            ))
+            time.sleep(0.5)
+            self._screenshot()
+            self._run(self._cua.click(
+                x=upload_x, y=upload_y, delivery_mode="foreground"
+            ))
+            time.sleep(0.5)
+            windows = self._run(self._cua._matching_windows(self.target_app))
+            if not any(str(window.get("title", "")).casefold() == "open" for window in windows):
+                raise RuntimeError("Upload did not open the native Open file dialog")
+
         # Type the file path directly into the system file picker and confirm
-        time.sleep(0.5)  # let the file picker open
         self._screenshot()  # select the modal file dialog before sending text
-        self._run(self._cua.type_text(file_path))
-        self._run(self._cua.key("return"))
+        dialog_elements = getattr(self._cua, "_last_elements", [])
+        filename_fields = [
+            element for element in dialog_elements
+            if str(element.get("role", "")).casefold() == "edit"
+            and str(element.get("label", "")).casefold() == "file name:"
+        ]
+        open_buttons = [
+            element for element in dialog_elements
+            if str(element.get("role", "")).casefold() in {"button", "splitbutton"}
+            and str(element.get("label", "")).casefold() == "open"
+            and "invoke" in element.get("actions", [])
+        ]
+        if filename_fields and open_buttons and "set_value" in getattr(self._cua, "_tools", {}):
+            self._run(self._cua.set_value(int(filename_fields[0]["element_index"]), file_path))
+            open_button = max(
+                open_buttons,
+                key=lambda element: (
+                    element.get("frame", {}).get("w", 0)
+                    * element.get("frame", {}).get("h", 0)
+                ),
+            )
+            self._run(self._cua.click(element=int(open_button["element_index"])))
+        else:
+            # Compatibility fallback for older cua-driver versions. Native
+            # Windows dialogs reject background keystrokes, and this exact
+            # path was explicitly authorized by the import command caller.
+            self._run(self._cua.type_text(file_path, delivery_mode="foreground"))
+            self._run(self._cua.key("return", delivery_mode="foreground"))
 
         # Return the resulting UI state without automated interpretation.
         time.sleep(2.0)
+        if hasattr(self._cua, "_matching_windows"):
+            windows = self._run(self._cua._matching_windows(self.target_app))
+            if any(str(window.get("title", "")).casefold() == "open" for window in windows):
+                raise RuntimeError("Protocol import did not close the Open file dialog")
         return {"file_path": file_path, "image_b64": self._screenshot()}
 
     # ── run lifecycle ──────────────────────────────────────────────────────
