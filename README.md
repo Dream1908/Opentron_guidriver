@@ -111,9 +111,10 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 ### Windows input verification
 
 - `click_at(x, y)` takes pixels from the returned screenshot, not desktop/AX coordinates. It validates screenshot bounds, dispatches once in the background, and returns the delivery effect and a fresh screenshot. Inspect that screenshot before any retry.
-- `import_protocol(file_path, upload_x=None, upload_y=None)` uses the current **Upload** label. Supply both optional coordinates from a fresh import-sidebar screenshot when Electron exposes incorrect/off-window AX geometry. Modal Open/Save dialogs take capture priority before typing.
-- Off-window accessibility targets and explicit cua-driver input failures now raise errors instead of silently succeeding. No automatic foreground escalation is performed.
-- `start_run()` reads back the displayed status and returns a screenshot; it no longer assumes a click means the robot is running. An unconfirmed-placement dialog can leave `started=False` and requires explicit handling.
+- `import_protocol(file_path, upload_x=None, upload_y=None)` always re-navigates to Protocols (which also closes a leftover side panel), clicks **Import** by exact label, then clicks **Upload** with a real foreground pixel click. Chromium ignores an accessibility "invoke" for the file chooser, and the slide-in panel's AX frames are reported off-window, so the pixel is derived by mirroring the frame about the window's right edge (no coordinates needed). `upload_x`/`upload_y` (from a fresh screenshot, not AX coordinates) remain available as an explicit override. cua-driver often reports "input rejected" for clicks that were delivered, so the import is verified by read-back instead: the Open dialog must appear and close, and the result carries `imported` (True/False/None) based on whether the protocol's `protocolName` shows up in the refreshed list.
+- Off-window accessibility targets and explicit cua-driver input failures raise errors instead of silently succeeding, except where a command verifies the outcome by read-back (import Upload/Open clicks, side-panel clicks).
+- `select_robot(robot_name="")` matches controls by exact label/structure (the robot card wrapping `robot_name`, then **Proceed to setup**), never fuzzy text. It first requires the Choose Robot panel (run `start_setup`), and verifies by read-back that the run screen opened. If a confirmation dialog appears it is returned, not clicked.
+- `start_run(confirm_dialog=False)` clicks the page's **Start run** button once, by exact label. If the App asks for confirmation (e.g. "labware and liquid placement not confirmed"), **nothing more is clicked**: the result has `needs_confirmation=True`, the dialog `text`/`buttons`, and a screenshot, so the operator can be asked first. Only after the operator approves, call `start_run(confirm_dialog=True)` to click the dialog's **Start run**. The flag is ignored unless this driver already reported that exact dialog, and it never chain-clicks a second dialog. `started` is only True once the displayed status is running/paused/finishing/completed.
 - Restart the user-managed `main.py` after driver edits to publish the new commands. Do not start duplicate edge instances.
 - Regression tests (no robot motion): `.\\.venv\\Scripts\\python.exe -m unittest discover -s tests -v`.
 
@@ -147,7 +148,7 @@ The Opentrons App must be **open and visible** on screen before starting the dri
 | Command | Args | Description |
 |---|---|---|
 | `select_robot` | `robot_name` | Choose the OT-2 on the setup screen |
-| `start_run` | — | Click "Start run" to begin the protocol |
+| `start_run` | `confirm_dialog` | Click "Start run"; stops and reports any confirmation dialog. Pass `confirm_dialog=true` only after the user approves it |
 | `pause_run` | — | Pause an active run |
 | `resume_run` | — | Resume a paused run |
 | `cancel_run` | — | Stop the run (with confirmation) |
@@ -183,6 +184,9 @@ puda machine run ot2-1 import_protocol --file_path "C:\protocols\serial_dilution
 puda machine run ot2-1 start_setup --protocol_name "Serial Dilution Tutorial"
 puda machine run ot2-1 select_robot
 puda machine run ot2-1 start_run
+# If the response has needs_confirmation=true, show the dialog to the operator;
+# only after they approve:
+puda machine run ot2-1 start_run --confirm_dialog true
 
 # Monitor progress
 puda machine run ot2-1 get_run_progress

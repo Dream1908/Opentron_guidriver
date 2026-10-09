@@ -458,6 +458,159 @@ class OpentronGuiDriver:
             "Capture the screen and use an explicit element or coordinate action."
         )
 
+    # ── exact-label helpers ────────────────────────────────────────────────
+    # The fuzzy ``_som_click`` scores word overlap and can pick the wrong
+    # control (e.g. close a side panel instead of advancing it). Commands that
+    # advance a run use these exact-label helpers instead.
+
+    def _snapshot_elements(self, attempts: int = 3) -> list[dict]:
+        """Capture a fresh accessibility snapshot and return its elements."""
+        elements: list[dict] = []
+        for attempt in range(attempts):
+            self._screenshot(mode="som")
+            elements = list(getattr(self._cua, "_last_elements", []) or [])
+            if elements:
+                break
+            if attempt < attempts - 1:
+                time.sleep(0.25)
+        return elements
+
+    @staticmethod
+    def _exact(elements: list[dict], label: str, roles: set[str] | None = None) -> list[dict]:
+        """Elements whose label equals ``label`` (case-insensitive, trimmed)."""
+        wanted = label.strip().casefold()
+        return [
+            element for element in elements
+            if str(element.get("label", "")).strip().casefold() == wanted
+            and (roles is None or str(element.get("role", "")).casefold() in roles)
+            and element.get("enabled", True)
+        ]
+
+    def _invoke_element(self, element: dict, tolerant: bool = False) -> bool:
+        """Invoke one accessibility element.
+
+        With ``tolerant=True`` a cua-driver "input rejected" error is logged and
+        swallowed (returns False): on this Electron surface some clicks are
+        reported as rejected although they were delivered, so the caller MUST
+        verify the effect by read-back before trusting or failing.
+        """
+        try:
+            self._run(self._cua.click(element=int(element["element_index"])))
+        except RuntimeError as exc:
+            if not tolerant or "input rejected" not in str(exc):
+                raise
+            logger.warning(
+                "click on %r reported rejected; verifying by read-back (%s)",
+                element.get("label"), exc,
+            )
+            return False
+        return True
+
+    def _click_label(self, label: str, fallback_description: str | None = None,
+                     roles: set[str] | None = None, tolerant: bool = False) -> int:
+        """Click the element labelled exactly ``label``; optionally fall back to fuzzy matching."""
+        matches = self._exact(self._snapshot_elements(), label, roles or {"button"})
+        if matches:
+            self._invoke_element(matches[0], tolerant=tolerant)
+            return int(matches[0]["element_index"])
+        if fallback_description is None:
+            raise RuntimeError(f"No enabled control labelled {label!r} on screen")
+        return self._som_click(fallback_description)
+
+    def _pending_dialog(self, elements: list[dict]) -> dict | None:
+        """Describe a modal confirmation dialog, or None when none is showing.
+
+        Opentrons confirmation modals ("Are you sure…?") always offer a
+        'Go back' button next to the confirming button.
+        """
+        go_back = self._exact(elements, "Go back", {"button"})
+        if not go_back:
+            return None
+        anchor = go_back[0]
+        frame = anchor.get("frame") or {}
+        texts: list[str] = []
+        buttons: list[str] = []
+        modal = self._modal_frame(elements, anchor)
+        if modal:
+            # The App exposes the dialog's exact bounds: take what is inside.
+            for element in elements:
+                label = str(element.get("label", "")).strip()
+                if element is anchor or not label or label.casefold() == "none":
+                    continue
+                if not self._inside(element, modal):
+                    continue
+                role = str(element.get("role", "")).casefold()
+                if role == "button":
+                    buttons.append(label)
+                elif role == "text":
+                    texts.append(label)
+        elif frame:
+            ax, ay = frame["x"], frame["y"]
+            for element in elements:
+                eframe = element.get("frame") or {}
+                if not eframe or element is anchor:
+                    continue
+                role = str(element.get("role", "")).casefold()
+                label = str(element.get("label", "")).strip()
+                if not label or label.casefold() == "none":
+                    continue
+                if role == "button" and abs(eframe["y"] - ay) <= 25:
+                    buttons.append(label)
+                elif role == "text" and 0 < ay - eframe["y"] <= 250 and abs(eframe["x"] - ax) <= 500:
+                    texts.append(label)
+        buttons.append(str(anchor.get("label")))
+        return {"text": texts, "buttons": buttons}
+
+    @classmethod
+    def _modal_frame(cls, elements: list[dict], anchor: dict | None = None) -> dict | None:
+        """Frame of the App's modal container (``ModalShell_ModalArea``), if exposed.
+
+        The tree can expose several "modal" groups (some page-wide); take the
+        smallest one that contains ``anchor`` (the dialog's 'Go back' button).
+        """
+        frames = [
+            element["frame"] for element in elements
+            if "modal" in str(element.get("label", "")).casefold()
+            and str(element.get("role", "")).casefold() == "group"
+            and element.get("frame")
+            and (anchor is None or cls._inside(anchor, element["frame"]))
+        ]
+        return min(frames, key=lambda f: f["w"] * f["h"], default=None)
+
+    @staticmethod
+    def _inside(element: dict, frame: dict) -> bool:
+        """True when the element lies entirely within ``frame``.
+
+        Whole-element containment (not just the centre) so that a wide page
+        element sitting behind a dialog is not mistaken for dialog content.
+        """
+        f = element.get("frame") or {}
+        if not f:
+            return False
+        return (frame["x"] <= f["x"] and f["x"] + f["w"] <= frame["x"] + frame["w"]
+                and frame["y"] <= f["y"] and f["y"] + f["h"] <= frame["y"] + frame["h"])
+
+    def _dialog_confirm_button(self, elements: list[dict], label: str) -> dict | None:
+        """The ``label`` button that sits in the dialog (inside its modal frame, else nearest 'Go back')."""
+        go_back = self._exact(elements, "Go back", {"button"})
+        candidates = self._exact(elements, label, {"button"})
+        if not go_back or not candidates:
+            return None
+        modal = self._modal_frame(elements, go_back[0])
+        if modal:
+            inside = [c for c in candidates if self._inside(c, modal)]
+            if inside:
+                return inside[0]
+        gframe = go_back[0].get("frame") or {}
+
+        def distance(element: dict) -> float:
+            frame = element.get("frame") or {}
+            if not frame or not gframe:
+                return 0.0
+            return abs(frame["x"] - gframe["x"]) + abs(frame["y"] - gframe["y"])
+
+        return min(candidates, key=distance)
+
     def _current_file_dialog(self) -> dict | None:
         """Return the open native file dialog, or None.
 
@@ -689,31 +842,69 @@ class OpentronGuiDriver:
             upload_y: Optional Upload-button Y; supply both coordinates together.
 
         Returns:
-            dict: {'file_path': str, 'imported': bool, 'message': str}
+            dict: {'file_path': str, 'protocol_name': str | None,
+                   'imported': bool | None, 'image_b64': str}.
+            ``imported`` is True when the protocol's metadata name is visible in
+            the refreshed Protocols list, False when it is not, and None when
+            the name could not be read from the file.
         """
         logger.info("import_protocol: %s", file_path)
         if (upload_x is None) != (upload_y is None):
             raise ValueError("Supply both upload_x and upload_y, or neither")
+
+        # Navigating via the sidebar also closes a side panel left open by an
+        # earlier attempt. (Do not try to detect an open panel from the
+        # accessibility tree: it keeps a stale "Upload" node after closing.)
         self.navigate_protocols()
+        # Import button (top-right of Protocols tab), matched by exact label.
+        self._click_label("Import", "Import button in the top right corner")
 
-        # Click the Import button (top-right of Protocols tab)
-        self._som_click("Import button in the top right corner")
+        # The side panel slides in; give it time to settle, then wait until its
+        # Upload button's frame stops changing. Not fatal when absent:
+        # explicit coordinates may be used.
+        time.sleep(1.0)
+        previous = None
+        for _ in range(10):
+            uploads = self._exact(self._snapshot_elements(attempts=1), "Upload", {"button"})
+            frame = uploads[0].get("frame") if uploads else None
+            if frame is not None and frame == previous:
+                break
+            previous = frame
+            time.sleep(0.5)
 
-        # Current app calls this Upload. Broken off-window AX coordinates must
-        # be replaced only by explicit, screenshot-grounded pixels, not guesses.
-        time.sleep(0.5)
-        if upload_x is not None:
-            self.click_at(upload_x, upload_y)
+        # Chromium only opens a native file chooser for a real user click, so an
+        # accessibility "invoke" of Upload is silently ignored. Use a foreground
+        # pixel click: explicit coordinates when supplied, otherwise pixels
+        # derived from the Upload element's frame. Either way the outcome is
+        # verified below by waiting for the native dialog.
+        explicit = upload_x is not None
+        derived = None if explicit else self._upload_pixel()
+        pixel = (upload_x, upload_y) if explicit else derived
+        if pixel is not None:
+            try:
+                self.click_at(*pixel)
+            except RuntimeError as exc:
+                # Reported "rejected" even when delivered; read-back decides.
+                if "input rejected" not in str(exc):
+                    raise
+                logger.warning("Upload click reported rejected; verifying by read-back (%s)", exc)
         else:
-            self._som_click("Upload")
+            self._click_label("Upload", "Upload", tolerant=True)
 
         time.sleep(0.5)
         # The app repaints slowly, so give the dialog time to appear.
         dialog = self._wait_file_dialog(timeout=15.0)
+        if dialog is None and derived is not None:
+            # Derived pixels missed: last resort is the accessibility invoke.
+            self._click_label("Upload", "Upload", tolerant=True)
+            time.sleep(0.5)
+            dialog = self._wait_file_dialog(timeout=5.0)
         if dialog is None:
-            if upload_x is None:
+            if not explicit:
                 raise RuntimeError(
-                    "Upload did not open the file dialog; provide screenshot-grounded upload_x/upload_y"
+                    "Upload did not open the native Open file dialog after invoking the "
+                    "Upload control; capture the screen, then retry with screenshot-grounded "
+                    "upload_x/upload_y"
                 )
 
             # Read-back proved that Electron dropped one of the background
@@ -753,7 +944,7 @@ class OpentronGuiDriver:
             if self._wait_file_dialog(appear=False, timeout=15.0) is not None:
                 raise RuntimeError("Protocol import did not close the Open file dialog")
             time.sleep(2.0)
-            return {"file_path": file_path, "image_b64": self._screenshot()}
+            return self._import_result(file_path)
 
         # Type the file path directly into the system file picker and confirm
         self._screenshot()  # select the modal file dialog before sending text
@@ -778,7 +969,9 @@ class OpentronGuiDriver:
                     * element.get("frame", {}).get("h", 0)
                 ),
             )
-            self._run(self._cua.click(element=int(open_button["element_index"])))
+            # Reported "rejected" even when delivered; the dialog-closed check
+            # below is the real verification.
+            self._invoke_element(open_button, tolerant=True)
         else:
             # Compatibility fallback for older cua-driver versions. Native
             # Windows dialogs reject background keystrokes, and this exact
@@ -786,13 +979,103 @@ class OpentronGuiDriver:
             self._run(self._cua.type_text(file_path, delivery_mode="foreground"))
             self._run(self._cua.key("return", delivery_mode="foreground"))
 
-        # Return the resulting UI state without automated interpretation.
+        # The dialog must close, otherwise the import did not happen.
         time.sleep(2.0)
         if hasattr(self._cua, "_matching_windows"):
             windows = self._run(self._cua._matching_windows(self.target_app))
             if any(str(window.get("title", "")).casefold() == "open" for window in windows):
                 raise RuntimeError("Protocol import did not close the Open file dialog")
-        return {"file_path": file_path, "image_b64": self._screenshot()}
+        return self._import_result(file_path)
+
+    def _element_pixel(self, element: dict) -> tuple[int, int] | None:
+        """Screenshot pixel of a horizontally-centred element in a slide-in side panel.
+
+        Side panels (Import a Protocol, Choose Robot) slide in from the right,
+        but the accessibility tree reports them at their pre-animation
+        position: translated right by exactly the panel's own width, so frames
+        lie outside the window (and cua-driver refuses to click them). An
+        element centred in the panel therefore mirrors about the window's
+        right edge to its real position (y is unaffected). Frames already
+        inside the window are used as they are. Returns None when the
+        geometry is unavailable or implausible.
+
+        Uses the geometry of the most recent capture, so ``element`` must come
+        from that same snapshot.
+        """
+        meta = getattr(self._cua, "_capture_meta", None) or {}
+        bounds = meta.get("window_bounds") or {}
+        width, height = meta.get("screenshot_width"), meta.get("screenshot_height")
+        frame = element.get("frame")
+        if not (frame and bounds and width and height):
+            return None
+        x = frame["x"] + frame["w"] / 2 - bounds["x"]
+        y = frame["y"] + frame["h"] / 2 - bounds["y"]
+        if x >= width:
+            x = 2 * width - x
+        if not (0 <= x < width and 0 <= y < height):
+            return None
+        return int(x), int(y)
+
+    def _click_panel_element(self, element: dict) -> None:
+        """Click a control that may live in a slide-in side panel.
+
+        If its AX frame lies outside the window (the slide-in offset described
+        in ``_element_pixel``) a plain invoke is refused by cua-driver, so click
+        the real pixel instead; otherwise invoke normally. A cua-driver "input
+        rejected" error on the pixel click is logged, not raised: such clicks
+        are often delivered anyway, and every caller verifies by read-back.
+        """
+        meta = getattr(self._cua, "_capture_meta", None) or {}
+        bounds = meta.get("window_bounds") or {}
+        frame = element.get("frame") or {}
+        off_window = bool(
+            frame and bounds
+            and frame["x"] + frame["w"] / 2 >= bounds["x"] + bounds["width"]
+        )
+        pixel = self._element_pixel(element) if off_window else None
+        if pixel is None:
+            self._invoke_element(element)
+            return
+        try:
+            self.click_at(*pixel)
+        except RuntimeError as exc:
+            if "input rejected" not in str(exc):
+                raise
+            logger.warning("click on %r reported rejected; verifying by read-back (%s)",
+                           element.get("label"), exc)
+
+    def _upload_pixel(self) -> tuple[int, int] | None:
+        """Screenshot pixel of the Import panel's Upload button (see ``_element_pixel``)."""
+        uploads = self._exact(getattr(self._cua, "_last_elements", []) or [], "Upload", {"button"})
+        return self._element_pixel(uploads[0]) if uploads else None
+
+    @staticmethod
+    def _protocol_name(file_path: str) -> str | None:
+        """Best-effort read of ``protocolName`` from a protocol file's metadata."""
+        try:
+            with open(file_path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            return None
+        match = re.search(r"""["']protocolName["']\s*:\s*["']([^"']+)["']""", text)
+        return match.group(1) if match else None
+
+    def _import_result(self, file_path: str) -> dict:
+        """Read the Protocols list back and report whether the import is visible."""
+        name = self._protocol_name(file_path)
+        imported: bool | None = None
+        if name:
+            wanted = name.casefold()
+            elements = self._snapshot_elements()
+            imported = any(wanted in str(e.get("label", "")).casefold() for e in elements)
+        if imported is False:
+            logger.warning("imported protocol %r not visible in the Protocols list", name)
+        return {
+            "file_path": file_path,
+            "protocol_name": name,
+            "imported": imported,
+            "image_b64": self._screenshot(),
+        }
 
     # ── run lifecycle ──────────────────────────────────────────────────────
     @command
@@ -824,47 +1107,236 @@ class OpentronGuiDriver:
         """
         Select the OT-2 robot on the setup screen.
 
-        If robot_name is empty, uses the driver's configured robot_name.
-        If only one robot is available, clicks it directly.
+        Run start_setup() first so the "Choose Robot" side panel is open.
+        Controls are matched by exact label/structure (never fuzzy text):
+        the robot card containing ``robot_name`` and the 'Proceed to setup'
+        button. If robot_name is empty and no ROBOT_NAME is configured, the
+        first listed robot is used.
+
+        This command never clicks through an unexpected confirmation dialog.
+        If one appears it is returned in ``dialog`` with
+        ``needs_confirmation=True`` and nothing further is clicked, so the
+        operator can be asked first.
 
         Args:
             robot_name: Display name of the robot in the App. Defaults to
                         the ROBOT_NAME set in .env.
 
         Returns:
-            dict: {'robot_name': str, 'selected': bool}
+            dict: {'robot_name': str, 'selected': bool, 'proceeded': bool,
+                   'needs_confirmation': bool, 'dialog': dict | None,
+                   'image_b64': str}
         """
         name = robot_name or self.robot_name
         logger.info("select_robot: %r", name)
-        if name:
-            self._som_click(f"robot named '{name}' in the robot selection list")
-        else:
-            # Select the first available robot
-            self._som_click("first available robot in the robot selection list")
 
-        import time
+        time.sleep(0.5)   # let the side panel finish sliding in before reading frames
+        elements = self._snapshot_elements()
+        dialog = self._pending_dialog(elements)
+        if dialog is not None:
+            return self._confirmation_needed("select_robot", dialog, robot_name=name,
+                                             selected=False, proceeded=False)
+
+        proceed = self._exact(elements, "Proceed to setup", {"button"})
+        if not proceed:
+            raise RuntimeError(
+                "The robot selection panel is not open (no 'Proceed to setup' button). "
+                "Run start_setup first."
+            )
+        card = self._robot_card(elements, name, proceed[0])
+        # The card is a Group (no native invoke) inside a slide-in panel whose
+        # AX frames are off-window; click its real pixel position.
+        self._click_panel_element(card)
         time.sleep(0.5)
-        self._som_click("Proceed to setup button")
-        return {"robot_name": name, "selected": True}
-    @command
-    def start_run(self) -> dict:
-        """
-        Click 'Start run' on the Run tab to begin executing the protocol.
 
-        Call this after start_setup() → select_robot() → (optional) Labware
-        Position Check. The Opentrons App must be on the setup or run screen.
+        # Re-read after the click: the panel re-renders and indices change.
+        elements = self._snapshot_elements()
+        dialog = self._pending_dialog(elements)
+        if dialog is not None:
+            return self._confirmation_needed("select_robot", dialog, robot_name=name,
+                                             selected=True, proceeded=False)
+        proceed = self._exact(elements, "Proceed to setup", {"button"})
+        if not proceed:
+            raise RuntimeError(
+                "'Proceed to setup' is missing or disabled after selecting the robot; "
+                "capture the screen to inspect the panel."
+            )
+        self._click_panel_element(proceed[0])
+
+        # Verify by read-back that the run screen opened. (The accessibility
+        # tree keeps stale nodes of a closed panel, so "Proceed to setup is
+        # gone" is not a reliable signal.)
+        for _ in range(10):
+            time.sleep(0.5)
+            elements = self._snapshot_elements()
+            dialog = self._pending_dialog(elements)
+            if dialog is not None:
+                return self._confirmation_needed("select_robot", dialog, robot_name=name,
+                                                 selected=True, proceeded=False)
+            on_run_page = any(
+                "/protocol-runs/" in str(e.get("value", ""))
+                for e in elements if str(e.get("role", "")).casefold() == "document"
+            ) or bool(self._exact(elements, "Start run", {"button"}))
+            if on_run_page:
+                return {"robot_name": name, "selected": True, "proceeded": True,
+                        "needs_confirmation": False, "dialog": None,
+                        "image_b64": self._screenshot()}
+        raise RuntimeError(
+            "Clicked 'Proceed to setup' but the run screen did not open; "
+            "capture the screen and inspect before retrying."
+        )
+
+    def _robot_card(self, elements: list[dict], name: str, proceed: dict) -> dict:
+        """The invokable card that wraps the robot's name in the Choose Robot panel."""
+        texts = [e for e in elements if str(e.get("role", "")).casefold() == "text"]
+        groups = [
+            e for e in elements
+            if str(e.get("role", "")).casefold() == "group"
+            and "invoke" in e.get("actions", []) and e.get("frame")
+        ]
+
+        def contains(group: dict, text: dict) -> bool:
+            g, t = group["frame"], text.get("frame") or {}
+            if not t:
+                return False
+            cx, cy = t["x"] + t["w"] / 2, t["y"] + t["h"] / 2
+            return g["x"] <= cx <= g["x"] + g["w"] and g["y"] <= cy <= g["y"] + g["h"]
+
+        def smallest(candidates: list[dict]) -> dict | None:
+            return min(candidates, key=lambda g: g["frame"]["w"] * g["frame"]["h"], default=None)
+
+        if name:
+            wanted = name.strip().casefold()
+            for text in texts:
+                if str(text.get("label", "")).strip().casefold() == wanted:
+                    card = smallest([g for g in groups if contains(g, text)])
+                    if card is not None:
+                        return card
+            shown = [str(t.get("label", "")) for t in texts if t.get("label")]
+            raise RuntimeError(
+                f"No robot card named {name!r} in the Choose Robot panel. "
+                f"Visible text: {shown[:20]}"
+            )
+
+        # No name: first card in the panel — a compact invokable group above
+        # 'Proceed to setup' that wraps some text, nearest the panel's top.
+        pframe = proceed.get("frame") or {}
+        cards = [
+            g for g in groups
+            if g["frame"]["h"] <= 200 and g["frame"]["w"] >= 150
+            and (not pframe or (g["frame"]["y"] < pframe["y"]
+                                and abs(g["frame"]["x"] - pframe["x"]) <= 40))
+            and any(contains(g, t) for t in texts)
+        ]
+        if not cards:
+            raise RuntimeError("No robot card found in the Choose Robot panel")
+        return min(cards, key=lambda g: g["frame"]["y"])
+
+    def _confirmation_needed(self, command_name: str, dialog: dict, **fields: Any) -> dict:
+        """Report a dialog to the caller without clicking it."""
+        self._reported_dialog = (command_name, tuple(dialog.get("text", [])),
+                                 tuple(dialog.get("buttons", [])))
+        logger.warning("%s: confirmation dialog pending, awaiting the user: %s",
+                       command_name, dialog)
+        return {**fields, "needs_confirmation": True,
+                "dialog": dialog, "image_b64": self._screenshot()}
+    @command
+    def start_run(self, confirm_dialog: bool = False) -> dict:
+        """
+        Click 'Start run' on the Run screen to begin executing the protocol.
+
+        Call this after start_setup() → select_robot(). The page's own
+        'Start run' button is clicked once, by exact label.
+
+        If the App then asks for confirmation (e.g. "Are you sure you want to
+        proceed to run? You haven't confirmed the labware and liquid placement"),
+        NOTHING further is clicked: the dialog text and buttons are returned
+        with ``needs_confirmation=True`` so the operator can be asked first.
+        Only after the operator approves, call start_run(confirm_dialog=True)
+        to click the dialog's 'Start run' button. confirm_dialog is ignored
+        unless this driver has already reported that dialog to the caller.
+
+        Args:
+            confirm_dialog: True only after the user has approved the reported
+                            dialog.
 
         Returns:
-            dict: {'started': bool, 'run_status': str}
+            dict: {'started': bool, 'run_status': str,
+                   'needs_confirmation': bool, 'dialog': dict | None,
+                   'image_b64': str}
         """
-        logger.info("start_run")
-        self._som_click("Start run button")
-        time.sleep(1.5)
-        image = self._screenshot()
-        labels = {str(e.get("label", "")).casefold() for e in self._cua._last_elements}
-        status = next((s for s in ("running", "not started", "paused", "completed", "failed")
-                       if s in labels), "unverified")
-        return {"started": status == "running", "run_status": status, "image_b64": image}
+        logger.info("start_run (confirm_dialog=%s)", confirm_dialog)
+        elements = self._snapshot_elements()
+        dialog = self._pending_dialog(elements)
+
+        if dialog is None:
+            starts = self._exact(elements, "Start run", {"button"})
+            if not starts:
+                raise RuntimeError(
+                    "No 'Start run' button on screen. Open the run with "
+                    "start_setup and select_robot first."
+                )
+            self._invoke_element(starts[0])
+            time.sleep(1.5)
+            elements = self._snapshot_elements()
+            dialog = self._pending_dialog(elements)
+
+        if dialog is not None:
+            reported = getattr(self, "_reported_dialog", None)
+            current = ("start_run", tuple(dialog.get("text", [])),
+                       tuple(dialog.get("buttons", [])))
+            if not (confirm_dialog and reported == current):
+                # Never click an unreviewed dialog: hand it back to the user.
+                return self._confirmation_needed(
+                    "start_run", dialog, started=False,
+                    run_status=self._run_status(elements),
+                )
+            button = self._dialog_confirm_button(elements, "Start run")
+            if button is None:
+                raise RuntimeError(
+                    f"The dialog has no 'Start run' button to confirm: {dialog}"
+                )
+            logger.info("start_run: user-approved dialog confirmed")
+            self._reported_dialog = None
+            self._invoke_element(button)
+            time.sleep(1.5)
+            elements = self._snapshot_elements()
+            dialog = self._pending_dialog(elements)
+            if dialog is not None and self._run_status(elements) not in (
+                    "running", "paused", "finishing", "completed"):
+                # Another (or the same, unclicked) confirmation: ask again,
+                # never chain-click. A dialog node that lingers in the tree
+                # while the run is already underway is ignored.
+                return self._confirmation_needed(
+                    "start_run", dialog, started=False,
+                    run_status=self._run_status(elements),
+                )
+
+        # Give the App a moment to reflect the new state, then read it back.
+        status = self._run_status(elements)
+        for _ in range(6):
+            if status not in ("not started", "unverified"):
+                break
+            time.sleep(1.0)
+            elements = self._snapshot_elements()
+            status = self._run_status(elements)
+        return {
+            "started": status in ("running", "paused", "finishing", "completed"),
+            "run_status": status,
+            "needs_confirmation": False,
+            "dialog": None,
+            "image_b64": self._screenshot(),
+        }
+
+    @staticmethod
+    def _run_status(elements: list[dict]) -> str:
+        """Run status as displayed by the App, or 'unverified'."""
+        labels = {str(e.get("label", "")).strip().casefold() for e in elements}
+        return next(
+            (s for s in ("running", "paused", "finishing", "completed", "failed",
+                         "stopped", "not started") if s in labels),
+            "unverified",
+        )
     @command
     def pause_run(self) -> dict:
         """
