@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from driver import CuaDriverClient, GuiDriver, OpentronGuiDriver
+from driver import CuaDriverClient, OpentronGuiDriver
 
 class DriverInputTests(unittest.TestCase):
     def test_status_navigates_to_devices_and_returns_current_image(self):
@@ -42,7 +42,7 @@ class DriverInputTests(unittest.TestCase):
                                           ('verified', route)])
 
     def test_route_verification_rejects_nested_protocol_detail(self):
-        driver = object.__new__(GuiDriver)
+        driver = object.__new__(OpentronGuiDriver)
         driver._cua = SimpleNamespace(_last_elements=[])
         captures = iter([
             'file:///app/index.html#/protocols/detail-id',
@@ -129,7 +129,7 @@ class DriverInputTests(unittest.TestCase):
         self.assertEqual(client._window_id,20)
 
     def test_pixel_command_rejects_coordinates_outside_screenshot(self):
-        driver = object.__new__(GuiDriver)
+        driver = object.__new__(OpentronGuiDriver)
         driver._cua = SimpleNamespace(_capture_meta={'screenshot_width':958,'screenshot_height':1138})
         driver._screenshot = lambda **kwargs: 'before'
         driver._run = lambda coro: self.fail('Out-of-bounds input must not be dispatched')
@@ -140,7 +140,7 @@ class DriverInputTests(unittest.TestCase):
             driver.click_at(1200,309)
 
     def test_puda_pixel_command_returns_delivery_effect_and_readback(self):
-        driver = object.__new__(GuiDriver)
+        driver = object.__new__(OpentronGuiDriver)
         self.assertTrue(callable(getattr(driver,'click_at',None)), 'PUDA screenshot-coordinate command is missing')
         calls = []
         async def click(**kwargs):
@@ -220,7 +220,7 @@ class DriverInputTests(unittest.TestCase):
         self.assertEqual((frame['x'], frame['y']), (0, 0))
 
     def test_off_window_accessibility_element_is_rejected_before_click(self):
-        driver = object.__new__(GuiDriver)
+        driver = object.__new__(OpentronGuiDriver)
         calls = []
         async def click(**kwargs):
             calls.append(kwargs)

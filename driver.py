@@ -60,9 +60,18 @@ class CuaDriverClient:
                 "Or set HERMES_CUA_DRIVER_CMD to the full path of your cua-driver binary."
             )
         # Force UTF-8 in the Python-based Windows child process.
+        import os
+        child_env = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        # On Linux the MCP stdio client only forwards a small allowlist of env
+        # vars, so display-session variables must be passed explicitly or
+        # cua-driver cannot see any windows.
+        for key in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
+                    "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "DBUS_SESSION_BUS_ADDRESS"):
+            if os.environ.get(key):
+                child_env[key] = os.environ[key]
         params = StdioServerParameters(
             command="cua-driver", args=["mcp"],
-            env={"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            env=child_env,
             encoding="utf-8", encoding_error_handler="replace",
         )
         # Pass stderr as bytes. On Windows, a text stderr stream uses the active
@@ -121,6 +130,23 @@ class CuaDriverClient:
                 "Open the Opentrons App in the logged-in desktop session."
             )
         return matches
+
+    async def _find_file_dialog(self) -> dict[str, Any] | None:
+        """Return the native file-open dialog window, if one is open.
+
+        Windows names it "Open" under the app; on Linux the GNOME file chooser
+        is owned by xdg-desktop-portal-* and titled "Open Files", so it must be
+        found among all windows rather than by app name.
+        """
+        result = await self._call("list_windows", {"on_screen_only": False})
+        for window in self._structured(result).get("windows", []):
+            title = str(window.get("title", "")).casefold()
+            app = str(window.get("app_name", "")).casefold()
+            if title in {"open", "open file", "open files"} and (
+                "portal" in app or "opentrons" in app or not app
+            ):
+                return window
+        return None
 
     async def _make_window_visible(self, window: dict[str, Any]) -> dict[str, Any]:
         """Restore an exact window to the primary display and foreground it."""
@@ -312,18 +338,46 @@ class CuaDriverClient:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Generic GUI driver base  (reusable across instruments)
+# Opentrons OT-2 GUI driver
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GuiDriver:
+class OpentronGuiDriver:
     """
-    Base PUDA GUI driver — controls any desktop software via Hermes computer use.
+    PUDA GUI driver for the Opentrons OT-2 liquid-handling robot.
 
-    Public methods are exposed as PUDA commands; helpers use a leading underscore.
-    Screen capture and UI interaction use cua-driver only; no LLM is required.
+    Controls the **Opentrons desktop App** (not the robot directly) via
+    Hermes computer use — no HTTP API or SSH required. All commands interact
+    with the App's UI the same way a human operator would.
+
+    Opentrons App navigation recap
+    ───────────────────────────────
+    Left sidebar  → Protocols | Devices | Settings
+    Protocols tab → Import button (top-right) | protocol list (⋮ menu per row)
+    Setup screen  → Robot Calibration → Labware Position Check → Proceed to Run
+    Run tab       → Start run | Pause | Cancel run | live step log
+
+    PUDA commands
+    ─────────────
+    status              — returns the raw screenshot without interpretation
+    get_protocol_list   — list all protocols visible in the Protocols tab
+    import_protocol     — Import a protocol file into the App
+    start_setup         — Open setup for a named protocol (⋮ → Start setup)
+    select_robot        — Choose the OT-2 robot on the setup screen
+    start_run           — Click "Start run" to begin the protocol
+    pause_run           — Pause an active run
+    resume_run          — Resume a paused run
+    cancel_run          — Cancel / stop the current run
+    get_run_progress    — Read current step and progress from the Run tab
+    navigate_protocols  — Go to the Protocols tab in the sidebar
+    navigate_devices    — Go to the Devices tab in the sidebar
+    home                — Navigate to the Protocols tab (home screen)
     """
 
-    def __init__(self, target_app: str) -> None:
+    def __init__(
+        self,
+        target_app: str = "Opentrons",
+        robot_name: str = "",
+    ) -> None:
         self.target_app = target_app
         self._last_status: dict = {}
         self._cua = CuaDriverClient()
@@ -333,10 +387,13 @@ class GuiDriver:
             target=self._loop.run_forever, daemon=True, name="guidriver-async-loop"
         )
         self._loop_thread.start()
+        self.robot_name = robot_name   # used by select_robot to pick the right OT-2
+
+    # ── generic GUI helpers & base PUDA commands (merged from the former GuiDriver) ──
 
     def _startup(self) -> None:
         self._run(self._cua.start())
-        logger.info("GuiDriver ready — target_app=%r", self.target_app)
+        logger.info("OpentronGuiDriver ready — target_app=%r", self.target_app)
 
     def _run(self, coro) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=60)
@@ -401,6 +458,48 @@ class GuiDriver:
             "Capture the screen and use an explicit element or coordinate action."
         )
 
+    def _current_file_dialog(self) -> dict | None:
+        """Return the open native file dialog, or None.
+
+        First the original check (a window of the target app titled "Open",
+        which is how Windows exposes it); then, for Linux/GNOME where the
+        chooser belongs to xdg-desktop-portal, a search across all windows.
+        """
+        windows = self._run(self._cua._matching_windows(self.target_app))
+        for window in windows:
+            if str(window.get("title", "")).casefold() == "open":
+                return window
+        finder = getattr(self._cua, "_find_file_dialog", None)
+        return self._run(finder()) if finder is not None else None
+
+    def _wait_file_dialog(self, appear: bool = True, timeout: float = 15.0) -> dict | None:
+        """Poll until the native file dialog appears (or disappears if appear=False)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            dialog = self._current_file_dialog()
+            if appear and dialog is not None:
+                return dialog
+            if not appear and dialog is None:
+                return None
+            if time.monotonic() >= deadline:
+                return dialog
+            time.sleep(0.5)
+
+    def _type_into_file_dialog(self, dialog: dict, file_path: str) -> None:
+        """Type a path into the GNOME/GTK file chooser: Ctrl+L, path, Enter."""
+        # Re-target the next input at the dialog window, not the app window.
+        self._cua._pid = int(dialog["pid"])
+        self._cua._window_id = int(dialog["window_id"])
+        self._run(self._cua._call("bring_to_front", {
+            "pid": self._cua._pid, "window_id": self._cua._window_id,
+        }))
+        time.sleep(1.0)
+        self._run(self._cua.key("ctrl+l", delivery_mode="foreground"))
+        time.sleep(0.5)
+        self._run(self._cua.type_text(file_path, delivery_mode="foreground"))
+        time.sleep(0.5)
+        self._run(self._cua.key("return", delivery_mode="foreground"))
+
     def _verify_route(self, route: str) -> None:
         """Refresh the UI tree and fail unless the Electron URL is on route."""
         expected = f"/{route.strip('/')}"
@@ -416,10 +515,14 @@ class GuiDriver:
                 return
             if attempt < 4:
                 time.sleep(0.25)
+        if not fragments and sys.platform.startswith("linux"):
+            # The Linux accessibility tree does not expose the Electron URL, so
+            # the route cannot be verified. Only skip when there is no route
+            # info at all; a visible wrong route still fails above.
+            logger.warning("route %s unverifiable: no URL exposed in accessibility tree", expected)
+            return
         raise RuntimeError(f"Opentrons navigation did not reach #{expected}")
     # ── base PUDA commands ─────────────────────────────────────────────────
-    def _snapshot(self) -> dict:
-        return {"target_app": self.target_app, "last_status": self._last_status}
     @command
     def capture_screenshot(self) -> dict:
         """Return a raw base64 PNG screenshot of the target application."""
@@ -495,49 +598,6 @@ class GuiDriver:
             logger.warning("stream_status failed: %s", e)
             return None
 
-
-# Opentrons OT-2 GUI driver
-# ─────────────────────────────────────────────────────────────────────────────
-
-class OpentronGuiDriver(GuiDriver):
-    """
-    PUDA GUI driver for the Opentrons OT-2 liquid-handling robot.
-
-    Controls the **Opentrons desktop App** (not the robot directly) via
-    Hermes computer use — no HTTP API or SSH required. All commands interact
-    with the App's UI the same way a human operator would.
-
-    Opentrons App navigation recap
-    ───────────────────────────────
-    Left sidebar  → Protocols | Devices | Settings
-    Protocols tab → Import button (top-right) | protocol list (⋮ menu per row)
-    Setup screen  → Robot Calibration → Labware Position Check → Proceed to Run
-    Run tab       → Start run | Pause | Cancel run | live step log
-
-    PUDA commands
-    ─────────────
-    status              — returns the raw screenshot without interpretation
-    get_protocol_list   — list all protocols visible in the Protocols tab
-    import_protocol     — Import a protocol file into the App
-    start_setup         — Open setup for a named protocol (⋮ → Start setup)
-    select_robot        — Choose the OT-2 robot on the setup screen
-    start_run           — Click "Start run" to begin the protocol
-    pause_run           — Pause an active run
-    resume_run          — Resume a paused run
-    cancel_run          — Cancel / stop the current run
-    get_run_progress    — Read current step and progress from the Run tab
-    navigate_protocols  — Go to the Protocols tab in the sidebar
-    navigate_devices    — Go to the Devices tab in the sidebar
-    home                — Navigate to the Protocols tab (home screen)
-    """
-
-    def __init__(
-        self,
-        target_app: str = "Opentrons",
-        robot_name: str = "",
-    ) -> None:
-        super().__init__(target_app=target_app)
-        self.robot_name = robot_name   # used by select_robot to pick the right OT-2
 
     # ── machine state ──────────────────────────────────────────────────────
     def _snapshot(self) -> dict:
@@ -648,8 +708,9 @@ class OpentronGuiDriver(GuiDriver):
             self._som_click("Upload")
 
         time.sleep(0.5)
-        windows = self._run(self._cua._matching_windows(self.target_app))
-        if not any(str(window.get("title", "")).casefold() == "open" for window in windows):
+        # The app repaints slowly, so give the dialog time to appear.
+        dialog = self._wait_file_dialog(timeout=15.0)
+        if dialog is None:
             if upload_x is None:
                 raise RuntimeError(
                     "Upload did not open the file dialog; provide screenshot-grounded upload_x/upload_y"
@@ -682,9 +743,17 @@ class OpentronGuiDriver(GuiDriver):
                 x=upload_x, y=upload_y, delivery_mode="foreground"
             ))
             time.sleep(0.5)
-            windows = self._run(self._cua._matching_windows(self.target_app))
-            if not any(str(window.get("title", "")).casefold() == "open" for window in windows):
+            dialog = self._wait_file_dialog(timeout=15.0)
+            if dialog is None:
                 raise RuntimeError("Upload did not open the native Open file dialog")
+
+        if "portal" in str(dialog.get("app_name", "")).casefold():
+            # GNOME file chooser: a separate portal-owned X11 window.
+            self._type_into_file_dialog(dialog, file_path)
+            if self._wait_file_dialog(appear=False, timeout=15.0) is not None:
+                raise RuntimeError("Protocol import did not close the Open file dialog")
+            time.sleep(2.0)
+            return {"file_path": file_path, "image_b64": self._screenshot()}
 
         # Type the file path directly into the system file picker and confirm
         self._screenshot()  # select the modal file dialog before sending text
